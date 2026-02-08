@@ -1,0 +1,9 @@
+
+storage/
+*.wav
+.idea/
+__pycache__/
+*.pyc
+venv/
+.venv1/
+.venv311/
