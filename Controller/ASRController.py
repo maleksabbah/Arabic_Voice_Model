@@ -4,10 +4,10 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
-from Database import get_db
-from Model import Series, Episode, Chunk
-from ASRService import IngestionService, IngestionError
-from TranscriptionService import get_consensus_service
+from Config.Database import get_db
+from Training.Model import Series, Episode, Chunk
+from Service.ASRService import IngestionService, IngestionError
+from Service.TranscriptionService import get_consensus_service
 
 router = APIRouter()
 
@@ -275,12 +275,59 @@ async def ingest_video(
         return result
     except IngestionError as e:
         raise HTTPException(status_code=500, detail=str(e))
+@router.post("/series/{series_id}/ingest/video-folder")
+async def ingest_video_folder(
+        series_id: int,
+        folder_path: str = Form(...),
+        db: Session = Depends(get_db)
+):
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
 
+    folder = Path(folder_path)
+    if not folder.exists():
+        raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
+
+    video_extensions = {".mp4", ".mkv", ".avi", ".mov"}
+    video_files = sorted([f for f in folder.rglob('*') if f.suffix.lower() in video_extensions and not f.name.startswith('._')])
+
+    if not video_files:
+        raise HTTPException(status_code=400, detail="No video files found in folder")
+
+    print(f"\nFound {len(video_files)} videos in {folder_path}")
+
+    service = IngestionService(db)
+    results = []
+
+    for ep_num, video_path in enumerate(video_files, 1):
+        print(f"\n[Episode {ep_num}/{len(video_files)}] Processing {video_path.name}")
+        try:
+            with open(video_path, "rb") as f:
+                result = service.process_episode(
+                    video_file=f,
+                    video_filename=video_path.name,
+                    series_id=series.id,
+                    episode_name=video_path.stem,
+                    episode_number=ep_num,
+                    max_chunk_sec=25
+                )
+            results.append(result)
+            print(f"Done: {result.get('chunk_count', 0)} chunks")
+        except Exception as e:
+            print(f"Error: {e}")
+            results.append({
+                "episode_number": ep_num,
+                "status": "failed",
+                "error": str(e)
+            })
+
+    return {"episodes": results, "total": len(results)}
 
 @router.post("/series/{series_id}/ingest/video-batch")
 async def ingest_video_batch(
         series_id: int,
-        files: List[UploadFile] = File(...),
+        files: List[UploadFile],
         max_chunk_sec: int = Form(45),
         db: Session = Depends(get_db)
 ):
@@ -598,7 +645,7 @@ async def ingest_nadi_2025(
 
     Splits: train (~51.5K), augment (~6K), dev (~1.5K)
     """
-    from ASRService import IngestionService
+    from Service.ASRService import IngestionService
 
     series = db.query(Series).filter(Series.id == series_id).first()
     if not series:
@@ -639,7 +686,7 @@ async def ingest_casablanca(
     Pass dialects as comma-separated string, e.g. "Jordan,Palestine" for Levantine only.
     Leave empty for all dialects.
     """
-    from ASRService import IngestionService
+    from Service.ASRService import IngestionService
 
     series = db.query(Series).filter(Series.id == series_id).first()
     if not series:
@@ -796,225 +843,237 @@ async def ingest_chunks_consensus_batch(
 
 @router.get("/upload-page", response_class=HTMLResponse)
 def upload_page():
+    # Copy this entire return statement and replace the existing upload_page function's return
+
     return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Batch Upload</title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-            h2 { color: #333; }
-            h3 { color: #666; margin-top: 30px; }
-            .form-group { margin: 20px 0; }
-            label { display: block; margin-bottom: 5px; font-weight: bold; }
-            input[type="file"] { padding: 10px; border: 2px dashed #ccc; width: 100%; box-sizing: border-box; }
-            input[type="number"] { padding: 8px; width: 100px; }
-            button { background: #4CAF50; color: white; padding: 12px 24px; border: none; cursor: pointer; font-size: 16px; margin-top: 20px; }
-            button:hover { background: #45a049; }
-            button:disabled { background: #ccc; cursor: not-allowed; }
-            .note { color: #666; font-size: 14px; margin-top: 5px; }
-            .section { background: #f9f9f9; padding: 15px; border-radius: 8px; margin: 15px 0; }
-            .tab { display: none; }
-            .tab.active { display: block; }
-            .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-            .tabs button { background: #ddd; color: #333; margin-top: 0; }
-            .tabs button.active { background: #4CAF50; color: white; }
-            #status { display: none; margin-top: 20px; padding: 15px; border-radius: 8px; }
-            pre { white-space: pre-wrap; word-wrap: break-word; margin-top: 8px; }
-            .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-left: 6px; }
-            .badge-new { background: #ff9800; color: white; }
-        </style>
-    </head>
-    <body>
-        <h2>Batch Upload</h2>
-        <p class="note">Filenames must contain episode number: "Ep 5", "eps10", "ep_3", or "_5_". Duplicates and unmatched pairs are skipped automatically.</p>
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Batch Upload</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+                h2 { color: #333; }
+                h3 { color: #666; margin-top: 30px; }
+                .form-group { margin: 20px 0; }
+                label { display: block; margin-bottom: 5px; font-weight: bold; }
+                input[type="file"] { padding: 10px; border: 2px dashed #ccc; width: 100%; box-sizing: border-box; }
+                input[type="number"], input[type="text"] { padding: 8px; width: 100%; box-sizing: border-box; }
+                button { background: #4CAF50; color: white; padding: 12px 24px; border: none; cursor: pointer; font-size: 16px; margin-top: 20px; }
+                button:hover { background: #45a049; }
+                button:disabled { background: #ccc; cursor: not-allowed; }
+                .note { color: #666; font-size: 14px; margin-top: 5px; }
+                .section { background: #f9f9f9; padding: 15px; border-radius: 8px; margin: 15px 0; }
+                .tab { display: none; }
+                .tab.active { display: block; }
+                .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+                .tabs button { background: #ddd; color: #333; margin-top: 0; }
+                .tabs button.active { background: #4CAF50; color: white; }
+                #status { display: none; margin-top: 20px; padding: 15px; border-radius: 8px; }
+                pre { white-space: pre-wrap; word-wrap: break-word; margin-top: 8px; }
+                .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-left: 6px; }
+                .badge-new { background: #ff9800; color: white; }
+            </style>
+        </head>
+        <body>
+            <h2>Batch Upload</h2>
 
-        <div class="tabs">
-            <button class="active" onclick="showTab('chunks')">Chunks + JSON</button>
-            <button onclick="showTab('consensus')">Chunks (Consensus) <span class="badge badge-new">NEW</span></button>
-            <button onclick="showTab('srt')">SRT + Media</button>
-            <button onclick="showTab('video')">Videos Only</button>
-        </div>
+            <div class="tabs">
+                <button class="active" onclick="showTab('folder')">Folder Path <span class="badge badge-new">NEW</span></button>
+                <button onclick="showTab('video')">Single Video</button>
+                <button onclick="showTab('chunks')">Chunks + JSON</button>
+                <button onclick="showTab('consensus')">Chunks (Consensus)</button>
+                <button onclick="showTab('srt')">SRT + Media</button>
+            </div>
 
-        <div id="chunks" class="tab active">
-            <h3>Upload Chunks (ZIP) + Transcripts (JSON)</h3>
-            <form action="/api/series/1/ingest/chunks-batch" method="post" enctype="multipart/form-data" id="chunksForm">
-                <div class="form-group">
-                    <label>Series ID:</label>
-                    <input type="number" id="chunksSeriesId" value="1" min="1">
-                </div>
-                <div class="section">
+            <div id="folder" class="tab active">
+                <h3>Ingest from Local Folder</h3>
+                <p class="note">Enter the full path to a folder containing video files. The server reads directly from disk. All MP4s in the folder are processed and numbered automatically.</p>
+                <form action="/api/series/1/ingest/video-folder" method="post" enctype="multipart/form-data" id="folderForm">
                     <div class="form-group">
-                        <label>ZIP Files (audio chunks):</label>
-                        <input type="file" name="files" multiple accept=".zip">
-                        <p class="note">Select all episode ZIPs (Ctrl+A)</p>
+                        <label>Series ID:</label>
+                        <input type="number" id="folderSeriesId" value="1" min="1" style="width: 100px;">
                     </div>
-                </div>
-                <div class="section">
+                    <div class="section">
+                        <div class="form-group">
+                            <label>Folder Path:</label>
+                            <input type="text" name="folder_path" placeholder="G:\\El_Madah -S2" style="padding: 10px;">
+                            <p class="note">Full path to folder with MP4/MKV/AVI/MOV files. Example: G:\\El_Madah -S2</p>
+                        </div>
+                    </div>
+                    <button type="submit">Process All Videos</button>
+                </form>
+            </div>
+
+            <div id="video" class="tab">
+                <h3>Upload Single Video</h3>
+                <form action="/api/series/1/ingest/video" method="post" enctype="multipart/form-data" id="videoForm">
                     <div class="form-group">
-                        <label>JSON Files (transcripts):</label>
-                        <input type="file" name="files" multiple accept=".json">
-                        <p class="note">Select all transcript JSONs (Ctrl+A)</p>
+                        <label>Series ID:</label>
+                        <input type="number" id="videoSeriesId" value="1" min="1" style="width: 100px;">
                     </div>
-                </div>
-                <button type="submit">Upload All</button>
-            </form>
-        </div>
+                    <div class="section">
+                        <div class="form-group">
+                            <label>Video File:</label>
+                            <input type="file" name="video" accept=".mp4,.mkv,.avi,.mov">
+                        </div>
+                    </div>
+                    <button type="submit">Upload</button>
+                </form>
+            </div>
 
-        <div id="consensus" class="tab">
-            <h3>Upload Chunks (ZIP) &mdash; Consensus Transcription</h3>
-            <p class="note" style="color: #e65100; font-weight: bold;">
-                No transcripts needed. Multiple ASR models will transcribe each chunk
-                and only save transcriptions where models agree. This takes longer but
-                produces clean training data.
-            </p>
-            <form action="/api/series/1/ingest/chunks-consensus-batch" method="post" enctype="multipart/form-data" id="consensusForm">
-                <div class="form-group">
-                    <label>Series ID:</label>
-                    <input type="number" id="consensusSeriesId" value="1" min="1">
-                </div>
-                <div class="section">
+            <div id="chunks" class="tab">
+                <h3>Upload Chunks (ZIP) + Transcripts (JSON)</h3>
+                <p class="note">Filenames must contain episode number (Ep 5, eps10, _5_).</p>
+                <form action="/api/series/1/ingest/chunks-batch" method="post" enctype="multipart/form-data" id="chunksForm">
                     <div class="form-group">
-                        <label>ZIP Files (audio chunks only, no JSON needed):</label>
-                        <input type="file" name="files" multiple accept=".zip">
-                        <p class="note">Select all episode ZIPs (Ctrl+A). Each ZIP = one episode.</p>
+                        <label>Series ID:</label>
+                        <input type="number" id="chunksSeriesId" value="1" min="1" style="width: 100px;">
                     </div>
-                </div>
-                <button type="submit">Upload &amp; Transcribe</button>
-            </form>
-        </div>
+                    <div class="section">
+                        <div class="form-group">
+                            <label>ZIP Files (audio chunks):</label>
+                            <input type="file" name="files" multiple accept=".zip">
+                            <p class="note">Select all episode ZIPs (Ctrl+A)</p>
+                        </div>
+                    </div>
+                    <div class="section">
+                        <div class="form-group">
+                            <label>JSON Files (transcripts):</label>
+                            <input type="file" name="files" multiple accept=".json">
+                            <p class="note">Select all transcript JSONs (Ctrl+A)</p>
+                        </div>
+                    </div>
+                    <button type="submit">Upload All</button>
+                </form>
+            </div>
 
-        <div id="srt" class="tab">
-            <h3>Upload SRT + Media Files</h3>
-            <form action="/api/series/1/ingest/srt-batch" method="post" enctype="multipart/form-data" id="srtForm">
-                <div class="form-group">
-                    <label>Series ID:</label>
-                    <input type="number" id="srtSeriesId" value="1" min="1">
-                </div>
-                <div class="section">
+            <div id="consensus" class="tab">
+                <h3>Upload Chunks (ZIP) &mdash; Consensus Transcription</h3>
+                <p class="note" style="color: #e65100; font-weight: bold;">
+                    No transcripts needed. Multiple ASR models will transcribe each chunk
+                    and only save transcriptions where models agree.
+                </p>
+                <form action="/api/series/1/ingest/chunks-consensus-batch" method="post" enctype="multipart/form-data" id="consensusForm">
                     <div class="form-group">
-                        <label>Media Files (mp4, mkv, mp3, wav, m4a):</label>
-                        <input type="file" name="files" multiple accept=".mp4,.mkv,.mp3,.wav,.m4a">
-                        <p class="note">Select all media files (Ctrl+A)</p>
+                        <label>Series ID:</label>
+                        <input type="number" id="consensusSeriesId" value="1" min="1" style="width: 100px;">
                     </div>
-                </div>
-                <div class="section">
+                    <div class="section">
+                        <div class="form-group">
+                            <label>ZIP Files (audio chunks only, no JSON needed):</label>
+                            <input type="file" name="files" multiple accept=".zip">
+                            <p class="note">Select all episode ZIPs (Ctrl+A). Each ZIP = one episode.</p>
+                        </div>
+                    </div>
+                    <button type="submit">Upload &amp; Transcribe</button>
+                </form>
+            </div>
+
+            <div id="srt" class="tab">
+                <h3>Upload SRT + Media Files</h3>
+                <p class="note">Filenames must contain episode number (Ep 5, eps10, _5_).</p>
+                <form action="/api/series/1/ingest/srt-batch" method="post" enctype="multipart/form-data" id="srtForm">
                     <div class="form-group">
-                        <label>SRT Files:</label>
-                        <input type="file" name="files" multiple accept=".srt">
-                        <p class="note">Select all SRT files (Ctrl+A)</p>
+                        <label>Series ID:</label>
+                        <input type="number" id="srtSeriesId" value="1" min="1" style="width: 100px;">
                     </div>
-                </div>
-                <button type="submit">Upload All</button>
-            </form>
-        </div>
-
-        <div id="video" class="tab">
-            <h3>Upload Videos (for chunking, no transcripts)</h3>
-            <form action="/api/series/1/ingest/video-batch" method="post" enctype="multipart/form-data" id="videoForm">
-                <div class="form-group">
-                    <label>Series ID:</label>
-                    <input type="number" id="videoSeriesId" value="1" min="1">
-                </div>
-                <div class="section">
-                    <div class="form-group">
-                        <label>Video Files (mp4, mkv, avi, mov):</label>
-                        <input type="file" name="files" multiple accept=".mp4,.mkv,.avi,.mov">
-                        <p class="note">Select all video files (Ctrl+A)</p>
+                    <div class="section">
+                        <div class="form-group">
+                            <label>Media Files (mp4, mkv, mp3, wav, m4a):</label>
+                            <input type="file" name="files" multiple accept=".mp4,.mkv,.mp3,.wav,.m4a">
+                            <p class="note">Select all media files (Ctrl+A)</p>
+                        </div>
                     </div>
-                </div>
-                <div class="form-group">
-                    <label>Max Chunk Seconds:</label>
-                    <input type="number" name="max_chunk_sec" value="45" min="10" max="120">
-                </div>
-                <button type="submit">Upload All</button>
-            </form>
-        </div>
+                    <div class="section">
+                        <div class="form-group">
+                            <label>SRT Files:</label>
+                            <input type="file" name="files" multiple accept=".srt">
+                            <p class="note">Select all SRT files (Ctrl+A)</p>
+                        </div>
+                    </div>
+                    <button type="submit">Upload All</button>
+                </form>
+            </div>
 
-        <div id="status"></div>
+            <div id="status"></div>
 
-        <script>
-            function showTab(name) {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
-                document.getElementById(name).classList.add('active');
-                event.target.classList.add('active');
-            }
+            <script>
+                function showTab(name) {
+                    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+                    document.getElementById(name).classList.add('active');
+                    event.target.classList.add('active');
+                }
 
-            document.getElementById('chunksSeriesId').addEventListener('change', function() {
-                document.getElementById('chunksForm').action = '/api/series/' + this.value + '/ingest/chunks-batch';
-            });
-            document.getElementById('consensusSeriesId').addEventListener('change', function() {
-                document.getElementById('consensusForm').action = '/api/series/' + this.value + '/ingest/chunks-consensus-batch';
-            });
-            document.getElementById('srtSeriesId').addEventListener('change', function() {
-                document.getElementById('srtForm').action = '/api/series/' + this.value + '/ingest/srt-batch';
-            });
-            document.getElementById('videoSeriesId').addEventListener('change', function() {
-                document.getElementById('videoForm').action = '/api/series/' + this.value + '/ingest/video-batch';
-            });
+                document.getElementById('folderSeriesId').addEventListener('change', function() {
+                    document.getElementById('folderForm').action = '/api/series/' + this.value + '/ingest/video-folder';
+                });
+                document.getElementById('videoSeriesId').addEventListener('change', function() {
+                    document.getElementById('videoForm').action = '/api/series/' + this.value + '/ingest/video';
+                });
+                document.getElementById('chunksSeriesId').addEventListener('change', function() {
+                    document.getElementById('chunksForm').action = '/api/series/' + this.value + '/ingest/chunks-batch';
+                });
+                document.getElementById('consensusSeriesId').addEventListener('change', function() {
+                    document.getElementById('consensusForm').action = '/api/series/' + this.value + '/ingest/chunks-consensus-batch';
+                });
+                document.getElementById('srtSeriesId').addEventListener('change', function() {
+                    document.getElementById('srtForm').action = '/api/series/' + this.value + '/ingest/srt-batch';
+                });
 
-            document.querySelectorAll('form').forEach(form => {
-                form.addEventListener('submit', async function(e) {
-                    e.preventDefault();
-                    const status = document.getElementById('status');
-                    const btn = form.querySelector('button[type="submit"]');
-                    const originalText = btn.textContent;
+                document.querySelectorAll('form').forEach(form => {
+                    form.addEventListener('submit', async function(e) {
+                        e.preventDefault();
+                        const status = document.getElementById('status');
+                        const btn = form.querySelector('button[type="submit"]');
+                        const originalText = btn.textContent;
 
-                    btn.disabled = true;
-                    btn.textContent = 'Uploading...';
-                    status.style.display = 'block';
-                    status.style.background = '#fff3cd';
-                    status.style.color = '#856404';
+                        btn.disabled = true;
+                        btn.textContent = 'Processing...';
+                        status.style.display = 'block';
+                        status.style.background = '#fff3cd';
+                        status.style.color = '#856404';
+                        status.innerHTML = '<b>Processing... This may take a while for large batches.</b>';
 
-                    const isConsensus = form.id === 'consensusForm';
-                    status.innerHTML = isConsensus
-                        ? '<b>Uploading &amp; running consensus transcription... This will take a while.</b>'
-                        : '<b>Uploading files... Please wait.</b>';
+                        try {
+                            const formData = new FormData(form);
+                            const resp = await fetch(form.action, { method: 'POST', body: formData });
+                            const data = await resp.json();
 
-                    try {
-                        const formData = new FormData(form);
-                        const resp = await fetch(form.action, { method: 'POST', body: formData });
-                        const data = await resp.json();
-
-                        if (!resp.ok) {
+                            if (!resp.ok) {
+                                status.style.background = '#f8d7da';
+                                status.style.color = '#721c24';
+                                status.innerHTML = '<b>Error:</b><pre>' +
+                                    (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail, null, 2)) + '</pre>';
+                            } else {
+                                status.style.background = '#d4edda';
+                                status.style.color = '#155724';
+                                let html = '<b>Success!</b><br>';
+                                if (data.episodes) {
+                                    html += '<br>Processed ' + data.total + ' episodes:<br><br>';
+                                    data.episodes.forEach(ep => {
+                                        const icon = ep.status === 'failed' ? '&#10060;' : '&#9989;';
+                                        html += icon + ' ' + (ep.name || 'Episode ' + (ep.episode_number || '?'));
+                                        if (ep.chunk_count) html += ' - ' + ep.chunk_count + ' chunks';
+                                        if (ep.duration) html += ' (' + Math.round(ep.duration / 60) + ' min)';
+                                        if (ep.error) html += ' - ERROR: ' + ep.error;
+                                        html += '<br>';
+                                    });
+                                } else {
+                                    html += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                                }
+                                status.innerHTML = html;
+                            }
+                        } catch(err) {
                             status.style.background = '#f8d7da';
                             status.style.color = '#721c24';
-                            status.innerHTML = '<b>Error:</b><pre>' +
-                                (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail, null, 2)) + '</pre>';
-                        } else {
-                            status.style.background = '#d4edda';
-                            status.style.color = '#155724';
-                            let html = '<b>Success!</b><br>';
-                            if (data.episodes) {
-                                html += '<br>Processed ' + data.total + ' episodes:<br><br>';
-                                data.episodes.forEach(ep => {
-                                    const icon = ep.status === 'failed' ? '&#10060;' : '&#9989;';
-                                    html += icon + ' Episode ' + (ep.episode_number || '?');
-                                    if (ep.chunk_count) html += ' - ' + ep.chunk_count + ' chunks';
-                                    if (ep.transcription) {
-                                        const t = ep.transcription;
-                                        html += ' (accepted: ' + (t.transcribed || 0) +
-                                                ', filtered: ' + (t.filtered || 0) + ')';
-                                    }
-                                    if (ep.error) html += ' - ERROR: ' + ep.error;
-                                    html += '<br>';
-                                });
-                            } else {
-                                html += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
-                            }
-                            status.innerHTML = html;
+                            status.innerHTML = '<b>Network Error:</b> ' + err.message;
                         }
-                    } catch(err) {
-                        status.style.background = '#f8d7da';
-                        status.style.color = '#721c24';
-                        status.innerHTML = '<b>Network Error:</b> ' + err.message;
-                    }
-                    btn.disabled = false;
-                    btn.textContent = originalText;
+                        btn.disabled = false;
+                        btn.textContent = originalText;
+                    });
                 });
-            });
-        </script>
-    </body>
-    </html>
-    """
+            </script>
+        </body>
+        </html>
+        """

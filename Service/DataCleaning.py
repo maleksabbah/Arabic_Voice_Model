@@ -4,7 +4,7 @@ from typing import Optional, List
 
 from sqlalchemy.orm import Session
 
-from Model import Episode, Chunk, ProcessingStatus
+from Training.Model import Episode, Chunk, ProcessingStatus
 
 
 class CleaningService:

@@ -2,8 +2,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from Database import init_db
-from ASRController import router
+from Config.Database import init_db
+from Controller.ASRController import router
 
 # Initialize database
 init_db()

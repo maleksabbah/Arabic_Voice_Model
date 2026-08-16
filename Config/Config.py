@@ -10,10 +10,10 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./storage/asr.db"
 
     # Storage paths
-    storage_root: Path = Path("./storage")
-    uploads_dir: Path = Path("./storage/uploads")  # Original MP4s
-    audio_dir: Path = Path("./storage/audio")  # Extracted WAVs
-    chunks_dir: Path = Path("./storage/chunks")  # Split chunks
+    storage_root: Path = Path("D:/tarjma_storage")
+    uploads_dir: Path = Path("D:/tarjma_storage/uploads")
+    audio_dir: Path = Path("D:/tarjma_storage/audio")
+    chunks_dir: Path = Path("D:/tarjma_storage/chunks")
 
     # Chunking defaults
     max_chunk_seconds: int = 25

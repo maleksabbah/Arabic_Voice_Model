@@ -9,7 +9,7 @@ from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 from Config.Database import get_db
 from Training.Model import Episode
-from ModelTraining import TrainingService
+from Training.ModelTraining import TrainingService
 
 
 # ============================================================================

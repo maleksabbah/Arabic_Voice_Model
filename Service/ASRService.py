@@ -15,8 +15,8 @@ from typing import List, Tuple, Optional, BinaryIO
 from sqlalchemy.orm import Session
 from datasets import load_dataset
 
-from Config import settings
-from Model import Series, Episode, Chunk, ProcessingStatus
+from Config.Config import settings
+from Training.Model import Series, Episode, Chunk, ProcessingStatus
 
 class IngestionError(Exception):
     pass
@@ -74,13 +74,11 @@ class IngestionService:
                 "status": "completed"
             }
         except Exception as e:
-            episode.status = ProcessingStatus.FAILED
-            episode.status_message = str(e)
-            self.db.commit()
+            self.db.rollback()
             return {
-                "episode_id": episode.id,
+                "episode_id": None,
                 "episode_number": episode_number,
-                "name": episode.name,
+                "name": episode.name or video_filename,
                 "status": "failed",
                 "error": str(e)
             }
@@ -1682,7 +1680,6 @@ class IngestionService:
         print(f"\n  Total: {len(all_chunks)} chunks, {total_duration / 3600:.2f}h")
         print(f"  Skipped: {total_skipped}")
         return summary
-
 
 
 
