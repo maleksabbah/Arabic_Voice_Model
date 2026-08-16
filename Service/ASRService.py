@@ -7,20 +7,22 @@ import json
 import tarfile
 import pandas as pd
 import soundfile as sf
+import numpy as np
 import io
 from pathlib import Path
 from typing import List, Tuple, Optional, BinaryIO
 
 from sqlalchemy.orm import Session
+from datasets import load_dataset
 
 from Config import settings
 from Model import Series, Episode, Chunk, ProcessingStatus
-
 
 class IngestionError(Exception):
     pass
 
 
+ARABIC_DIACRITICS = set("\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0670\u0655")
 class IngestionService:
     def __init__(self, db: Session):
         self.db = db
@@ -316,6 +318,132 @@ class IngestionService:
             print(f"  Done: {result.get('chunk_count', 0)} chunks")
         return results
 
+    # =========================================================================
+    # Add these methods to your IngestionService class
+    # =========================================================================
+
+    def process_episode_for_consensus(
+            self,
+            chunks_zip: BinaryIO,
+            series_id: int,
+            series_name: str,
+            episode_name: str,
+            episode_number: int,
+    ) -> dict:
+        temp_dir = self.uploads_dir / f"temp_series_{series_name}_{episode_number}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            zip_path = temp_dir / "chunks.zip"
+            with open(zip_path, "wb") as f:
+                shutil.copyfileobj(chunks_zip, f)
+
+            chunks_extract_dir = temp_dir / "chunks"
+            chunks_extract_dir.mkdir(parents=True, exist_ok=True)
+
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extractall(chunks_extract_dir)
+
+            wav_files = list(chunks_extract_dir.glob("**/*.wav"))
+            if not wav_files:
+                raise IngestionError("No wav files found in ZIP")
+
+            print(f"Found {len(wav_files)} wav files")
+
+            episode = Episode(
+                series_id=series_id,
+                name=episode_name,
+                episode_number=episode_number,
+                status=ProcessingStatus.PENDING,
+                status_message="Chunks saved, awaiting consensus transcription",
+            )
+            self.db.add(episode)
+            self.db.commit()
+            self.db.refresh(episode)
+
+            storage_dir = self.chunks_dir / f"episode_{episode.id}"
+            storage_dir.mkdir(parents=True, exist_ok=True)
+
+            chunks = []
+            total_duration = 0.0
+
+            for idx, wav_path in enumerate(sorted(wav_files)):
+                filename = wav_path.name
+                dest_path = storage_dir / filename
+                shutil.copy2(wav_path, dest_path)
+
+                duration = self._get_duration(dest_path)
+                total_duration += duration
+
+                chunk = Chunk(
+                    episode_id=episode.id,
+                    chunk_index=idx,
+                    filename=filename,
+                    file_path=str(dest_path),
+                    start_time=0,
+                    end_time=duration,
+                    duration=round(duration, 3),
+                    is_cleaned=False,
+                    transcription=None,
+                )
+                self.db.add(chunk)
+                chunks.append(chunk)
+
+            self.db.commit()
+
+            episode.duration_seconds = total_duration
+            episode.status = ProcessingStatus.COMPLETED
+            episode.status_message = f"Saved {len(chunks)} chunks (awaiting transcription)"
+            self.db.commit()
+
+            print(f"Done: {len(chunks)} chunks saved")
+
+            return {
+                "episode_id": episode.id,
+                "episode_number": episode_number,
+                "name": episode.name,
+                "duration": round(total_duration, 2),
+                "chunk_count": len(chunks),
+                "status": "completed",
+            }
+
+        except Exception as e:
+            return {
+                "episode_number": episode_number,
+                "name": episode_name,
+                "status": "failed",
+                "error": str(e),
+            }
+        finally:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+
+    def process_batch_for_consensus(
+            self,
+            zip_files: List[BinaryIO],
+            series_id: int,
+            series_name: str,
+            start_episode: int = 1,
+    ) -> List[dict]:
+        results = []
+        for idx, zip_file in enumerate(zip_files):
+            ep_num = start_episode + idx
+            print(f"\n[Episode {ep_num}] Processing")
+
+            result = self.process_episode_for_consensus(
+                chunks_zip=zip_file,
+                series_id=series_id,
+                series_name=series_name,
+                episode_name=f"Episode {ep_num}",
+                episode_number=ep_num,
+            )
+            results.append(result)
+            print(f"  Done: {result.get('chunk_count', 0)} chunks")
+
+        return results
+
+
+
     def process_masc_dataset(
             self,
             tar_path: str,
@@ -455,6 +583,100 @@ class IngestionService:
             "skipped": skipped,
             "total_duration_hours": round(total_duration / 3600, 2),
             "status": "completed"
+        }
+
+    def stream_egyptian_mgb3(
+            self,
+            series_id: int,
+            max_samples: Optional[int] = None,
+    ) -> dict:
+        """Stream MightyStudent/Egyptian-ASR-MGB-3 into the database."""
+        dataset_name = "MightyStudent/Egyptian-ASR-MGB-3"
+        episode_name = "Egyptian_MGB3"
+
+        print(f"Streaming {dataset_name}...")
+
+        ds = load_dataset(dataset_name, split="train", streaming=True,download_mode="force_redownload")
+
+        episode = Episode(
+            series_id=series_id,
+            name=episode_name,
+            status=ProcessingStatus.PROCESSING,
+            status_message=f"Streaming from {dataset_name}",
+        )
+        self.db.add(episode)
+        self.db.commit()
+        self.db.refresh(episode)
+
+        storage_dir = self.chunks_dir / f"episode_{episode.id}"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+
+        chunks = []
+        total_duration = 0.0
+        skipped = 0
+
+        for idx, sample in enumerate(ds):
+            if max_samples and idx >= max_samples:
+                break
+
+            text = sample.get("sentence", "").strip()
+            audio = sample.get("audio")
+
+            if not text or not audio:
+                skipped += 1
+                continue
+
+            audio_array = audio["array"]
+            sample_rate = audio["sampling_rate"]
+            duration = len(audio_array) / sample_rate
+
+            # Skip very short clips
+            if duration < 0.5:
+                skipped += 1
+                continue
+
+            filename = f"chunk_{idx:05d}.wav"
+            chunk_path = storage_dir / filename
+            sf.write(str(chunk_path), audio_array, sample_rate)
+
+            chunk = Chunk(
+                episode_id=episode.id,
+                chunk_index=idx,
+                filename=filename,
+                file_path=str(chunk_path),
+                start_time=0,
+                end_time=round(duration, 3),
+                duration=round(duration, 3),
+                is_cleaned=True,
+                transcription=text,
+            )
+            self.db.add(chunk)
+            chunks.append(chunk)
+            total_duration += duration
+
+            if len(chunks) % 100 == 0:
+                self.db.commit()
+                print(f"  Progress: {len(chunks)} chunks, {skipped} skipped")
+
+        self.db.commit()
+
+        episode.duration_seconds = total_duration
+        episode.status = ProcessingStatus.COMPLETED
+        episode.status_message = f"Streamed {len(chunks)} chunks"
+        self.db.commit()
+
+        print(f"\nDone!")
+        print(f"  Chunks: {len(chunks)}")
+        print(f"  Skipped: {skipped}")
+        print(f"  Duration: {total_duration / 3600:.2f} hours")
+
+        return {
+            "episode_id": episode.id,
+            "episode_name": episode_name,
+            "chunk_count": len(chunks),
+            "skipped": skipped,
+            "total_duration_hours": round(total_duration / 3600, 2),
+            "status": "completed",
         }
 
     def process_episode_with_srt(
@@ -939,33 +1161,527 @@ class IngestionService:
 
         print(f"Deleted files for episode {episode_id}")
 
+    def stream_common_voice_arabic(
+            self,
+            series_id: int,
+            max_samples: Optional[int] = None,
+            min_upvotes: int = 2,
+            min_duration: float = 1.0,
+            max_duration: float = 30.0,
+            dataset_version: str = "fsicoli/common_voice_17_0",
+    ) -> dict:
+        """Stream Common Voice Arabic into the database.
 
+        Requires HuggingFace login and accepting dataset terms at:
+        https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0
 
+        Run: huggingface-cli login
+        """
+        episode_name = "CV_Arabic"
 
+        print(f"\n{'=' * 80}")
+        print(f"COMMON VOICE ARABIC INGESTION")
+        print(f"{'=' * 80}")
+        print(f"  Dataset:      {dataset_version}")
+        print(f"  Series ID:    {series_id}")
+        print(f"  Max samples:  {max_samples or 'all'}")
+        print(f"  Min upvotes:  {min_upvotes}")
+        print(f"  Duration:     {min_duration}s - {max_duration}s")
+        print(f"{'=' * 80}")
 
+        print(f"\nStreaming {dataset_version} (ar)...")
+        ds = load_dataset(dataset_version, "ar", split="train", streaming=True, trust_remote_code=True)
 
+        episode = Episode(
+            series_id=series_id,
+            name=episode_name,
+            status=ProcessingStatus.PROCESSING,
+            status_message=f"Streaming from {dataset_version}",
+        )
+        self.db.add(episode)
+        self.db.commit()
+        self.db.refresh(episode)
 
+        storage_dir = self.chunks_dir / f"episode_{episode.id}"
+        storage_dir.mkdir(parents=True, exist_ok=True)
 
+        chunks = []
+        total_duration = 0.0
+        skipped = {"short": 0, "long": 0, "empty": 0, "low_votes": 0, "error": 0}
 
+        for idx, sample in enumerate(ds):
+            if max_samples and idx >= max_samples:
+                break
 
+            try:
+                # Get text
+                text = sample.get("sentence", "").strip()
+                if not text:
+                    skipped["empty"] += 1
+                    continue
 
+                # Quality filter: minimum upvotes
+                up_votes = sample.get("up_votes", 0)
+                if up_votes < min_upvotes:
+                    skipped["low_votes"] += 1
+                    continue
 
+                # Get audio
+                audio = sample.get("audio")
+                if not audio:
+                    skipped["error"] += 1
+                    continue
 
+                audio_array = np.array(audio["array"], dtype=np.float32)
+                sample_rate = audio["sampling_rate"]
+                duration = len(audio_array) / sample_rate
 
+                # Duration filters
+                if duration < min_duration:
+                    skipped["short"] += 1
+                    continue
+                if duration > max_duration:
+                    skipped["long"] += 1
+                    continue
 
+                # Resample to 16kHz if needed (Common Voice is 48kHz)
+                if sample_rate != 16000:
+                    import torchaudio
+                    import torch
+                    wav_tensor = torch.tensor(audio_array).unsqueeze(0)
+                    audio_array = torchaudio.transforms.Resample(sample_rate, 16000)(wav_tensor).squeeze(0).numpy()
+                    sample_rate = 16000
 
+                # Strip diacritics to match MASC format
+                text = "".join(c for c in text if c not in ARABIC_DIACRITICS)
+                text = " ".join(text.split()).strip()
+                if not text:
+                    skipped["empty"] += 1
+                    continue
 
+                # Save WAV
+                chunk_idx = len(chunks)
+                filename = f"chunk_{chunk_idx:05d}.wav"
+                chunk_path = storage_dir / filename
+                sf.write(str(chunk_path), audio_array, sample_rate)
 
+                # Create DB record
+                chunk = Chunk(
+                    episode_id=episode.id,
+                    chunk_index=chunk_idx,
+                    filename=filename,
+                    file_path=str(chunk_path),
+                    start_time=0,
+                    end_time=round(duration, 3),
+                    duration=round(duration, 3),
+                    is_cleaned=True,
+                    transcription=text,
+                )
+                self.db.add(chunk)
+                chunks.append(chunk)
+                total_duration += duration
 
+                # Progress
+                if len(chunks) % 500 == 0:
+                    self.db.commit()
+                    hours = total_duration / 3600
+                    total_skipped = sum(skipped.values())
+                    print(f"  Progress: {len(chunks)} chunks ({hours:.1f}h), "
+                          f"skipped: {total_skipped} "
+                          f"(votes={skipped['low_votes']}, short={skipped['short']})")
 
+            except Exception as e:
+                skipped["error"] += 1
+                if skipped["error"] <= 5:
+                    print(f"  Error on sample {idx}: {e}")
+                continue
 
+        self.db.commit()
 
+        episode.duration_seconds = total_duration
+        episode.status = ProcessingStatus.COMPLETED
+        episode.status_message = f"Streamed {len(chunks)} chunks from Common Voice"
+        self.db.commit()
 
+        hours = total_duration / 3600
+        total_skipped = sum(skipped.values())
 
+        print(f"\nDone!")
+        print(f"  Chunks: {len(chunks)}")
+        print(f"  Duration: {hours:.2f} hours")
+        print(f"  Skipped: {total_skipped}")
+        print(f"    Empty text:  {skipped['empty']}")
+        print(f"    Low votes:   {skipped['low_votes']}")
+        print(f"    Too short:   {skipped['short']}")
+        print(f"    Too long:    {skipped['long']}")
+        print(f"    Errors:      {skipped['error']}")
 
+        return {
+            "episode_id": episode.id,
+            "episode_name": episode_name,
+            "chunk_count": len(chunks),
+            "skipped": total_skipped,
+            "total_duration_hours": round(hours, 2),
+            "status": "completed",
+        }
 
+    """
+    TWO NEW METHODS for IngestionService.py
+    ========================================
+    Add both after stream_common_voice_arabic().
 
+    No new imports needed - numpy, torchaudio, torch, sf already used by CV method.
+    ARABIC_DIACRITICS constant should already exist from CV ingestion.
+    """
 
+    # ==============================================================================
+    # METHOD 1: stream_nadi_2025  --  Add to IngestionService.py
+    # ==============================================================================
+
+    def stream_nadi_2025(
+            self,
+            series_id: int,
+            max_samples: Optional[int] = None,
+            min_duration: float = 1.0,
+            max_duration: float = 30.0,
+            split: str = "train",
+    ) -> dict:
+        """Stream NADI 2025 multidialectal Arabic ASR data into the database.
+
+        Dataset: MBZUAI/NADI-2025-Sub-task-3-all
+        ~51.5K train, ~6K augment, ~1.5K dev
+        Mix of MSA, dialectal, classical, code-switched Arabic.
+        Transcriptions are diacritized -- we strip diacritics to match MASC format.
+        """
+        import numpy as np
+
+        episode_name = f"NADI2025_{split}"
+
+        print(f"\n{'=' * 80}")
+        print(f"NADI 2025 MULTIDIALECTAL ASR INGESTION")
+        print(f"{'=' * 80}")
+        print(f"  Dataset:          MBZUAI/NADI-2025-Sub-task-3-all")
+        print(f"  Split:            {split}")
+        print(f"  Series ID:        {series_id}")
+        print(f"  Max samples:      {max_samples or 'all'}")
+        print(f"  Duration:         {min_duration}s - {max_duration}s")
+        print(f"{'=' * 80}")
+
+        print(f"\nStreaming NADI 2025 ({split})...")
+        ds = load_dataset(
+            "MBZUAI/NADI-2025-Sub-task-3-all",
+            split=split,
+            streaming=True,
+            trust_remote_code=True,
+        )
+
+        episode = Episode(
+            series_id=series_id,
+            name=episode_name,
+            status=ProcessingStatus.PROCESSING,
+            status_message=f"Streaming NADI 2025 ({split})",
+        )
+        self.db.add(episode)
+        self.db.commit()
+        self.db.refresh(episode)
+
+        storage_dir = self.chunks_dir / f"episode_{episode.id}"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+
+        chunks = []
+        total_duration = 0.0
+        skipped = {"short": 0, "long": 0, "empty": 0, "error": 0}
+
+        for idx, sample in enumerate(ds):
+            if max_samples and len(chunks) >= max_samples:
+                break
+
+            try:
+                # Get transcription
+                text = sample.get("transcription", "").strip()
+                if not text:
+                    skipped["empty"] += 1
+                    continue
+
+                # Get audio
+                audio = sample.get("audio")
+                if not audio:
+                    skipped["error"] += 1
+                    continue
+
+                audio_array = np.array(audio["array"], dtype=np.float32)
+                sample_rate = audio["sampling_rate"]
+                duration = len(audio_array) / sample_rate
+
+                # Duration filters
+                if duration < min_duration:
+                    skipped["short"] += 1
+                    continue
+                if duration > max_duration:
+                    skipped["long"] += 1
+                    continue
+
+                # Resample to 16kHz if needed
+                if sample_rate != 16000:
+                    import torchaudio
+                    import torch
+                    wav_tensor = torch.tensor(audio_array).unsqueeze(0)
+                    audio_array = torchaudio.transforms.Resample(sample_rate, 16000)(wav_tensor).squeeze(0).numpy()
+                    sample_rate = 16000
+
+                # Strip diacritics to match MASC format
+                text = "".join(c for c in text if c not in ARABIC_DIACRITICS)
+                text = " ".join(text.split()).strip()
+                if not text:
+                    skipped["empty"] += 1
+                    continue
+
+                # Save WAV
+                chunk_idx = len(chunks)
+                filename = f"chunk_{chunk_idx:05d}.wav"
+                chunk_path = storage_dir / filename
+                sf.write(str(chunk_path), audio_array, sample_rate)
+
+                # Create DB record
+                chunk = Chunk(
+                    episode_id=episode.id,
+                    chunk_index=chunk_idx,
+                    filename=filename,
+                    file_path=str(chunk_path),
+                    start_time=0,
+                    end_time=round(duration, 3),
+                    duration=round(duration, 3),
+                    is_cleaned=True,
+                    transcription=text,
+                )
+                self.db.add(chunk)
+                chunks.append(chunk)
+                total_duration += duration
+
+                # Progress
+                if len(chunks) % 500 == 0:
+                    self.db.commit()
+                    hours = total_duration / 3600
+                    total_skipped = sum(skipped.values())
+                    print(f"  Progress: {len(chunks)} chunks ({hours:.1f}h), "
+                          f"skipped: {total_skipped} "
+                          f"(short={skipped['short']}, long={skipped['long']}, "
+                          f"empty={skipped['empty']}, error={skipped['error']})")
+
+            except Exception as e:
+                skipped["error"] += 1
+                if skipped["error"] <= 5:
+                    print(f"  Error at sample {idx}: {e}")
+                continue
+
+        # Final commit
+        self.db.commit()
+
+        # Update episode
+        episode.status = ProcessingStatus.COMPLETED
+        episode.status_message = (
+            f"Ingested {len(chunks)} chunks ({total_duration / 3600:.2f}h) from NADI 2025 ({split})"
+        )
+        self.db.commit()
+
+        summary = {
+            "episode_id": episode.id,
+            "episode_name": episode_name,
+            "chunks_ingested": len(chunks),
+            "total_duration_hours": round(total_duration / 3600, 2),
+            "skipped": skipped,
+        }
+
+        print(f"\n  Done: {len(chunks)} chunks, {total_duration / 3600:.2f}h")
+        print(f"  Skipped: {skipped}")
+        return summary
+
+    # ==============================================================================
+    # METHOD 2: stream_casablanca  --  Add to IngestionService.py
+    # ==============================================================================
+
+    def stream_casablanca(
+            self,
+            series_id: int,
+            dialects: Optional[list] = None,
+            max_samples: Optional[int] = None,
+            min_duration: float = 1.0,
+            max_duration: float = 30.0,
+    ) -> dict:
+        """Stream Casablanca multidialectal Arabic data into the database.
+
+        Dataset: UBC-NLP/Casablanca
+        Only val+test released (~13.6K samples, 8 dialects).
+        Dialects: Algeria, Egypt, Jordan, Mauritania, Morocco, Palestine, UAE, Yemen
+        Fields: audio, transcription, gender, duration, seg_id
+        """
+        import numpy as np
+
+        available_dialects = ["Algeria", "Egypt", "Jordan", "Mauritania",
+                              "Morocco", "Palestine", "UAE", "Yemen"]
+
+        if dialects is None:
+            dialects = available_dialects
+        else:
+            for d in dialects:
+                if d not in available_dialects:
+                    raise IngestionError(
+                        f"Unknown dialect '{d}'. Available: {available_dialects}"
+                    )
+
+        print(f"\n{'=' * 80}")
+        print(f"CASABLANCA MULTIDIALECTAL ARABIC INGESTION")
+        print(f"{'=' * 80}")
+        print(f"  Dataset:          UBC-NLP/Casablanca")
+        print(f"  Dialects:         {dialects}")
+        print(f"  Series ID:        {series_id}")
+        print(f"  Max samples:      {max_samples or 'all'}")
+        print(f"  Duration:         {min_duration}s - {max_duration}s")
+        print(f"{'=' * 80}")
+
+        all_chunks = []
+        total_duration = 0.0
+        total_skipped = {"short": 0, "long": 0, "empty": 0, "error": 0}
+
+        for dialect in dialects:
+            print(f"\n  Streaming {dialect}...")
+
+            # Load both val and test splits
+            for split in ["validation", "test"]:
+                try:
+                    ds = load_dataset(
+                        "UBC-NLP/Casablanca",
+                        dialect,
+                        split=split,
+                        streaming=True,
+                        trust_remote_code=True,
+                    )
+                except Exception as e:
+                    print(f"    Error loading {dialect}/{split}: {e}")
+                    continue
+
+                ep_name = f"Casablanca_{dialect}_{split}"
+                episode = Episode(
+                    series_id=series_id,
+                    name=ep_name,
+                    status=ProcessingStatus.PROCESSING,
+                    status_message=f"Streaming Casablanca {dialect} ({split})",
+                )
+                self.db.add(episode)
+                self.db.commit()
+                self.db.refresh(episode)
+
+                storage_dir = self.chunks_dir / f"episode_{episode.id}"
+                storage_dir.mkdir(parents=True, exist_ok=True)
+
+                chunks = []
+                ep_duration = 0.0
+                skipped = {"short": 0, "long": 0, "empty": 0, "error": 0}
+
+                for idx, sample in enumerate(ds):
+                    if max_samples and (len(all_chunks) + len(chunks)) >= max_samples:
+                        break
+
+                    try:
+                        # Get transcription
+                        text = sample.get("transcription", "").strip()
+                        if not text:
+                            skipped["empty"] += 1
+                            continue
+
+                        # Get audio
+                        audio = sample.get("audio")
+                        if not audio:
+                            skipped["error"] += 1
+                            continue
+
+                        audio_array = np.array(audio["array"], dtype=np.float32)
+                        sample_rate = audio["sampling_rate"]
+                        duration = len(audio_array) / sample_rate
+
+                        # Duration filters
+                        if duration < min_duration:
+                            skipped["short"] += 1
+                            continue
+                        if duration > max_duration:
+                            skipped["long"] += 1
+                            continue
+
+                        # Resample to 16kHz if needed
+                        if sample_rate != 16000:
+                            import torchaudio
+                            import torch
+                            wav_tensor = torch.tensor(audio_array).unsqueeze(0)
+                            audio_array = torchaudio.transforms.Resample(sample_rate, 16000)(wav_tensor).squeeze(
+                                0).numpy()
+                            sample_rate = 16000
+
+                        # Strip diacritics to match MASC format
+                        text = "".join(c for c in text if c not in ARABIC_DIACRITICS)
+                        text = " ".join(text.split()).strip()
+                        if not text:
+                            skipped["empty"] += 1
+                            continue
+
+                        # Save WAV
+                        chunk_idx = len(chunks)
+                        filename = f"chunk_{chunk_idx:05d}.wav"
+                        chunk_path = storage_dir / filename
+                        sf.write(str(chunk_path), audio_array, sample_rate)
+
+                        # Create DB record
+                        chunk = Chunk(
+                            episode_id=episode.id,
+                            chunk_index=chunk_idx,
+                            filename=filename,
+                            file_path=str(chunk_path),
+                            start_time=0,
+                            end_time=round(duration, 3),
+                            duration=round(duration, 3),
+                            is_cleaned=True,
+                            transcription=text,
+                        )
+                        self.db.add(chunk)
+                        chunks.append(chunk)
+                        ep_duration += duration
+
+                    except Exception as e:
+                        skipped["error"] += 1
+                        if skipped["error"] <= 3:
+                            print(f"    Error at {dialect}/{split} sample {idx}: {e}")
+                        continue
+
+                # Commit this episode
+                self.db.commit()
+                episode.status = ProcessingStatus.COMPLETED
+                episode.status_message = (
+                    f"Ingested {len(chunks)} chunks ({ep_duration / 3600:.2f}h)"
+                )
+                self.db.commit()
+
+                all_chunks.extend(chunks)
+                total_duration += ep_duration
+                for k in skipped:
+                    total_skipped[k] += skipped[k]
+
+                print(f"    {dialect}/{split}: {len(chunks)} chunks ({ep_duration / 3600:.2f}h)")
+
+                if max_samples and len(all_chunks) >= max_samples:
+                    break
+
+            if max_samples and len(all_chunks) >= max_samples:
+                break
+
+        summary = {
+            "chunks_ingested": len(all_chunks),
+            "total_duration_hours": round(total_duration / 3600, 2),
+            "dialects_processed": dialects,
+            "skipped": total_skipped,
+        }
+
+        print(f"\n  Total: {len(all_chunks)} chunks, {total_duration / 3600:.2f}h")
+        print(f"  Skipped: {total_skipped}")
+        return summary
 
 
 

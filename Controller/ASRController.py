@@ -7,13 +7,10 @@ from sqlalchemy.orm import Session
 from Database import get_db
 from Model import Series, Episode, Chunk
 from ASRService import IngestionService, IngestionError
+from TranscriptionService import get_consensus_service
 
 router = APIRouter()
 
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
 
 def extract_episode_number(filename: str) -> Optional[int]:
     """
@@ -95,7 +92,28 @@ def validate_episode_pairs(
         )
 
     return matched
+@router.patch("/series/{series_id}")
+def update_series(
+    series_id: int,
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
 
+    if name:
+        existing = db.query(Series).filter(Series.name == name, Series.id != series_id).first()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Series name '{name}' already taken")
+        series.name = name
+    if description is not None:
+        series.description = description
+
+    db.commit()
+    db.refresh(series)
+    return {"id": series.id, "name": series.name, "description": series.description}
 
 # ============================================================================
 # SERIES ENDPOINTS
@@ -509,6 +527,268 @@ async def ingest_masc_dataset(
     except IngestionError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================================
+# HUGGINGFACE STREAMING ENDPOINT
+# ============================================================================
+@router.post("/series/{series_id}/ingest/egyptian-mgb3")
+async def ingest_egyptian_mgb3(
+        series_id: int,
+        max_samples: Optional[int] = Form(None),
+        db: Session = Depends(get_db),
+):
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+
+    service = IngestionService(db)
+    result = service.stream_egyptian_mgb3(
+        series_id=series_id,
+        max_samples=max_samples,
+    )
+    return result
+
+
+@router.post("/series/{series_id}/ingest/common-voice-arabic")
+async def ingest_common_voice_arabic(
+        series_id: int,
+        max_samples: Optional[int] = Form(None),
+        min_upvotes: int = Form(2),
+        min_duration: float = Form(1.0),
+        max_duration: float = Form(30.0),
+        db: Session = Depends(get_db),
+):
+    """Stream Common Voice Arabic into the database.
+
+    Requires HuggingFace login: huggingface-cli login
+    Accept terms at: https://huggingface.co/datasets/mozilla-foundation/common_voice_17_0
+    """
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+
+    service = IngestionService(db)
+    result = service.stream_common_voice_arabic(
+        series_id=series_id,
+        max_samples=max_samples,
+        min_upvotes=min_upvotes,
+        min_duration=min_duration,
+        max_duration=max_duration,
+    )
+    return result
+"""
+CONTROLLER ENDPOINTS for ASRController.py
+==========================================
+Add these two endpoints after the ingest_common_voice_arabic endpoint.
+"""
+
+
+@router.post("/series/{series_id}/ingest/nadi-2025")
+async def ingest_nadi_2025(
+    series_id: int,
+    max_samples: Optional[int] = Form(None),
+    min_duration: float = Form(1.0),
+    max_duration: float = Form(30.0),
+    split: str = Form("train"),
+    db: Session = Depends(get_db),
+):
+    """Ingest NADI 2025 multidialectal Arabic ASR dataset.
+
+    51.5K train samples covering MSA, dialectal, classical, code-switched Arabic.
+    Diacritics are stripped to match MASC format.
+
+    Splits: train (~51.5K), augment (~6K), dev (~1.5K)
+    """
+    from ASRService import IngestionService
+
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail=f"Series {series_id} not found")
+
+    valid_splits = ["train", "augment", "dev"]
+    if split not in valid_splits:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid split '{split}'. Must be one of: {valid_splits}",
+        )
+
+    svc = IngestionService(db)
+    result = svc.stream_nadi_2025(
+        series_id=series_id,
+        max_samples=max_samples,
+        min_duration=min_duration,
+        max_duration=max_duration,
+        split=split,
+    )
+    return result
+
+
+@router.post("/series/{series_id}/ingest/casablanca")
+async def ingest_casablanca(
+    series_id: int,
+    dialects: Optional[str] = Form(None),
+    max_samples: Optional[int] = Form(None),
+    min_duration: float = Form(1.0),
+    max_duration: float = Form(30.0),
+    db: Session = Depends(get_db),
+):
+    """Ingest Casablanca multidialectal Arabic dataset (val+test only).
+
+    ~13.6K samples across 8 dialects. Only validation and test splits available.
+    Dialects: Algeria, Egypt, Jordan, Mauritania, Morocco, Palestine, UAE, Yemen
+
+    Pass dialects as comma-separated string, e.g. "Jordan,Palestine" for Levantine only.
+    Leave empty for all dialects.
+    """
+    from ASRService import IngestionService
+
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail=f"Series {series_id} not found")
+
+    dialect_list = None
+    if dialects:
+        dialect_list = [d.strip() for d in dialects.split(",")]
+
+    svc = IngestionService(db)
+    result = svc.stream_casablanca(
+        series_id=series_id,
+        dialects=dialect_list,
+        max_samples=max_samples,
+        min_duration=min_duration,
+        max_duration=max_duration,
+    )
+    return result
+# ============================================================================
+@router.post("/series/{series_id}/ingest/chunks-consensus")
+async def ingest_chunks_for_consensus(
+        series_id: int,
+        chunks_zip: UploadFile = File(...),
+        episode_number: Optional[int] = Form(None),
+        db: Session = Depends(get_db),
+):
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+
+    if episode_number is None:
+        episode_number = extract_episode_number(chunks_zip.filename)
+        if episode_number is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not extract episode number from '{chunks_zip.filename}'. "
+                       f"Use format like 'Ep 5', 'eps10', '_3_' in filename, or provide episode_number manually."
+            )
+
+    try:
+        service = IngestionService(db)
+        chunks_zip.file.seek(0)
+
+        result = service.process_episode_for_consensus(
+            chunks_zip=chunks_zip.file,
+            series_id=series.id,
+            series_name=series.name,
+            episode_name=f"Episode {episode_number}",
+            episode_number=episode_number,
+        )
+        return result
+    except IngestionError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+# ============================================================================
+# UPLOAD PAGE
+# ============================================================================
+
+# ============================================================================
+# CONSENSUS TRANSCRIPTION ENDPOINTS
+# Add these after the existing ingestion endpoints, before the upload page
+# ============================================================================
+
+@router.post("/series/{series_id}/ingest/chunks-consensus")
+async def ingest_chunks_for_consensus(
+        series_id: int,
+        chunks_zip: UploadFile = File(...),
+        episode_number: Optional[int] = Form(None),
+        db: Session = Depends(get_db),
+):
+    """
+    Ingest a ZIP of WAV chunks with NO transcripts.
+    Runs multi-model consensus transcription internally.
+    Only saves transcriptions where models agree.
+    """
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+
+    if episode_number is None:
+        episode_number = extract_episode_number(chunks_zip.filename)
+        if episode_number is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not extract episode number from '{chunks_zip.filename}'. "
+                       f"Use format like 'Ep 5', 'eps10', '_3_' in filename, or provide episode_number manually."
+            )
+
+    try:
+        service = IngestionService(db)
+        chunks_zip.file.seek(0)
+
+        result = service.process_episode_for_consensus(
+            chunks_zip=chunks_zip.file,
+            series_id=series.id,
+            series_name=series.name,
+            episode_name=f"Episode {episode_number}",
+            episode_number=episode_number,
+        )
+        return result
+    except IngestionError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/series/{series_id}/ingest/chunks-consensus-batch")
+async def ingest_chunks_consensus_batch(
+        series_id: int,
+        files: List[UploadFile] = File(...),
+        db: Session = Depends(get_db),
+):
+    """
+    Batch ingest multiple ZIPs of WAV chunks with NO transcripts.
+    Each ZIP is one episode. Consensus transcription runs on all.
+    """
+    series = db.query(Series).filter(Series.id == series_id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+
+    zip_episodes = parse_and_validate_files(files, [".zip"])
+
+    service = IngestionService(db)
+    results = []
+
+    for ep_num in sorted(zip_episodes.keys()):
+        zip_file = zip_episodes[ep_num]
+        print(f"\n[Episode {ep_num}] Processing {zip_file.filename}")
+
+        try:
+            zip_file.file.seek(0)
+            result = service.process_episode_for_consensus(
+                chunks_zip=zip_file.file,
+                series_id=series.id,
+                series_name=series.name,
+                episode_name=f"Episode {ep_num}",
+                episode_number=ep_num,
+            )
+            results.append(result)
+
+            t = result.get("transcription", {})
+            print(f"  Done: {t.get('transcribed', 0)} accepted, {t.get('filtered', 0)} filtered")
+        except Exception as e:
+            print(f"  Error: {e}")
+            results.append({
+                "episode_number": ep_num,
+                "status": "failed",
+                "error": str(e),
+            })
+
+    return {"episodes": results, "total": len(results)}
+
 
 # ============================================================================
 # UPLOAD PAGE
@@ -536,11 +816,13 @@ def upload_page():
             .section { background: #f9f9f9; padding: 15px; border-radius: 8px; margin: 15px 0; }
             .tab { display: none; }
             .tab.active { display: block; }
-            .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+            .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
             .tabs button { background: #ddd; color: #333; margin-top: 0; }
             .tabs button.active { background: #4CAF50; color: white; }
             #status { display: none; margin-top: 20px; padding: 15px; border-radius: 8px; }
             pre { white-space: pre-wrap; word-wrap: break-word; margin-top: 8px; }
+            .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-left: 6px; }
+            .badge-new { background: #ff9800; color: white; }
         </style>
     </head>
     <body>
@@ -549,6 +831,7 @@ def upload_page():
 
         <div class="tabs">
             <button class="active" onclick="showTab('chunks')">Chunks + JSON</button>
+            <button onclick="showTab('consensus')">Chunks (Consensus) <span class="badge badge-new">NEW</span></button>
             <button onclick="showTab('srt')">SRT + Media</button>
             <button onclick="showTab('video')">Videos Only</button>
         </div>
@@ -575,6 +858,29 @@ def upload_page():
                     </div>
                 </div>
                 <button type="submit">Upload All</button>
+            </form>
+        </div>
+
+        <div id="consensus" class="tab">
+            <h3>Upload Chunks (ZIP) &mdash; Consensus Transcription</h3>
+            <p class="note" style="color: #e65100; font-weight: bold;">
+                No transcripts needed. Multiple ASR models will transcribe each chunk
+                and only save transcriptions where models agree. This takes longer but
+                produces clean training data.
+            </p>
+            <form action="/api/series/1/ingest/chunks-consensus-batch" method="post" enctype="multipart/form-data" id="consensusForm">
+                <div class="form-group">
+                    <label>Series ID:</label>
+                    <input type="number" id="consensusSeriesId" value="1" min="1">
+                </div>
+                <div class="section">
+                    <div class="form-group">
+                        <label>ZIP Files (audio chunks only, no JSON needed):</label>
+                        <input type="file" name="files" multiple accept=".zip">
+                        <p class="note">Select all episode ZIPs (Ctrl+A). Each ZIP = one episode.</p>
+                    </div>
+                </div>
+                <button type="submit">Upload &amp; Transcribe</button>
             </form>
         </div>
 
@@ -638,6 +944,9 @@ def upload_page():
             document.getElementById('chunksSeriesId').addEventListener('change', function() {
                 document.getElementById('chunksForm').action = '/api/series/' + this.value + '/ingest/chunks-batch';
             });
+            document.getElementById('consensusSeriesId').addEventListener('change', function() {
+                document.getElementById('consensusForm').action = '/api/series/' + this.value + '/ingest/chunks-consensus-batch';
+            });
             document.getElementById('srtSeriesId').addEventListener('change', function() {
                 document.getElementById('srtForm').action = '/api/series/' + this.value + '/ingest/srt-batch';
             });
@@ -657,7 +966,11 @@ def upload_page():
                     status.style.display = 'block';
                     status.style.background = '#fff3cd';
                     status.style.color = '#856404';
-                    status.innerHTML = '<b>Uploading files... Please wait.</b>';
+
+                    const isConsensus = form.id === 'consensusForm';
+                    status.innerHTML = isConsensus
+                        ? '<b>Uploading &amp; running consensus transcription... This will take a while.</b>'
+                        : '<b>Uploading files... Please wait.</b>';
 
                     try {
                         const formData = new FormData(form);
@@ -677,9 +990,15 @@ def upload_page():
                                 html += '<br>Processed ' + data.total + ' episodes:<br><br>';
                                 data.episodes.forEach(ep => {
                                     const icon = ep.status === 'failed' ? '&#10060;' : '&#9989;';
-                                    html += icon + ' Episode ' + (ep.episode_number || '?') +
-                                        (ep.chunk_count ? ' - ' + ep.chunk_count + ' chunks' : '') +
-                                        (ep.error ? ' - ERROR: ' + ep.error : '') + '<br>';
+                                    html += icon + ' Episode ' + (ep.episode_number || '?');
+                                    if (ep.chunk_count) html += ' - ' + ep.chunk_count + ' chunks';
+                                    if (ep.transcription) {
+                                        const t = ep.transcription;
+                                        html += ' (accepted: ' + (t.transcribed || 0) +
+                                                ', filtered: ' + (t.filtered || 0) + ')';
+                                    }
+                                    if (ep.error) html += ' - ERROR: ' + ep.error;
+                                    html += '<br>';
                                 });
                             } else {
                                 html += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';

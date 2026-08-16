@@ -7,7 +7,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
-from Database import Base
+from Config.Database import Base
 
 
 class ProcessingStatus(str, PyEnum):

@@ -12,15 +12,21 @@ from jiwer import wer, cer
 
 from sqlalchemy.orm import Session
 
-from DataLoader import DataLoader
+from Config.DataLoader import DataLoader
 
 # Try to load BERTScore
 try:
     import evaluate
-
     BERTSCORE_AVAILABLE = True
 except:
     BERTSCORE_AVAILABLE = False
+
+# Try to load PEFT/LoRA
+try:
+    from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+    PEFT_AVAILABLE = True
+except:
+    PEFT_AVAILABLE = False
 
 
 class TrainingService:
@@ -46,18 +52,26 @@ class TrainingService:
         self.bertscore = None
 
         # Training config
-        # Training config
         self.config = {
             "epochs": 3,
-            "learning_rates": [1e-4, 5e-5, 2e-5],
-            "gradient_clips": [1.0, 0.5, 0.3],
+            "learning_rates": [5e-5, 3e-5, 1e-5],
+            "gradient_clips": [0.5, 0.3, 0.3],
             "freeze_encoder": [False, False, False],
+            "freeze_decoder": [True,True,True],  # Protect decoder by default
             "validation_split": 0.15,
             "random_seed": 42,
             "gradient_log_frequency": 100,
             "gradient_detailed_log": 500,
             "save_detailed_results": True,
             "show_examples": 50,
+        }
+
+        # LoRA config defaults
+        self.lora_config = {
+            "r": 16,
+            "lora_alpha": 32,
+            "lora_dropout": 0.05,
+            "target_modules": ["q_proj", "v_proj"],
         }
 
         # Generation config
@@ -87,11 +101,12 @@ class TrainingService:
 
         return max(numbers) + 1 if numbers else 1
 
-    def _create_run_dir(self) -> Path:
+    def _create_run_dir(self, lora: bool = False) -> Path:
         """Create a new run directory."""
         run_num = self._get_next_run_number()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        run_name = f"run_{run_num:03d}_{timestamp}"
+        prefix = "lora" if lora else "run"
+        run_name = f"{prefix}_{run_num:03d}_{timestamp}"
 
         run_dir = self.checkpoints_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -99,6 +114,7 @@ class TrainingService:
         print(f"\n{'=' * 80}")
         print(f"TRAINING RUN: {run_name}")
         print(f"{'=' * 80}")
+        print(f"   Mode: {'LoRA' if lora else 'Full Fine-tuning'}")
         print(f"   Source model: {self.source_model}")
         print(f"   Saving to: {run_dir}")
 
@@ -107,7 +123,7 @@ class TrainingService:
     def list_runs(self) -> List[Dict]:
         """List all available runs."""
         runs = []
-        for run_path in sorted(self.checkpoints_dir.glob("run_*")):
+        for run_path in sorted(self.checkpoints_dir.glob("run_*")) + sorted(self.checkpoints_dir.glob("lora_*")):
             info = {"name": run_path.name, "path": str(run_path)}
 
             # Try to load training log for more info
@@ -118,6 +134,7 @@ class TrainingService:
                         log = json.load(f)
                     info["source_model"] = log.get("config", {}).get("source_model", "unknown")
                     info["epochs"] = len(log.get("epochs", []))
+                    info["lora"] = log.get("config", {}).get("lora", False)
                     if log.get("epochs"):
                         last_epoch = log["epochs"][-1]
                         info["final_wer"] = last_epoch.get("validation_metrics", {}).get("wer", {}).get("mean")
@@ -142,7 +159,8 @@ class TrainingService:
             for run in runs:
                 wer_str = f", WER: {run['final_wer']:.4f}" if run.get('final_wer') else ""
                 epochs_str = f", Epochs: {run['epochs']}" if run.get('epochs') else ""
-                print(f"   {run['name']}{epochs_str}{wer_str}")
+                lora_str = " [LoRA]" if run.get('lora') else ""
+                print(f"   {run['name']}{lora_str}{epochs_str}{wer_str}")
                 print(f"      Path: {run['path']}")
                 if run.get('source_model'):
                     print(f"      Source: {run['source_model']}")
@@ -176,6 +194,41 @@ class TrainingService:
 
         return self.model, self.processor
 
+    def _apply_lora(self, r: int = None, lora_alpha: int = None,
+                    lora_dropout: float = None, target_modules: List[str] = None):
+        """Apply LoRA adapters to the model."""
+        if not PEFT_AVAILABLE:
+            raise ImportError("peft is not installed. Run: pip install peft")
+
+        r = r or self.lora_config["r"]
+        lora_alpha = lora_alpha or self.lora_config["lora_alpha"]
+        lora_dropout = lora_dropout or self.lora_config["lora_dropout"]
+        target_modules = target_modules or self.lora_config["target_modules"]
+
+        config = LoraConfig(
+            r=r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+        )
+
+        # Freeze all parameters first
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # Make input features trainable (needed for conv layers in encoder)
+        self.model.model.encoder.conv1.requires_grad_(True)
+        self.model.model.encoder.conv2.requires_grad_(True)
+
+        # Apply LoRA
+        self.model = get_peft_model(self.model, config)
+
+        # Print trainable params
+        self.model.print_trainable_parameters()
+
+        return config
+
     def train(
             self,
             series_configs: List[Dict],
@@ -183,15 +236,19 @@ class TrainingService:
             learning_rates: Optional[List[float]] = None,
             gradient_clips: Optional[List[float]] = None,
             freeze_encoder: Optional[List[bool]] = None,
+            freeze_decoder: Optional[List[bool]] = None,
+            episode_ids: Optional[List[int]] = None,
+            max_samples: Optional[int] = None,
     ) -> dict:
 
         epochs = epochs or self.config["epochs"]
         learning_rates = learning_rates or self.config["learning_rates"]
         gradient_clips = gradient_clips or self.config["gradient_clips"]
         freeze_encoder = freeze_encoder or self.config["freeze_encoder"]
+        freeze_decoder = freeze_decoder or self.config["freeze_decoder"]
 
         # Create new run directory
-        self.run_dir = self._create_run_dir()
+        self.run_dir = self._create_run_dir(lora=False)
 
         # Load model from source
         self.load_model()
@@ -199,7 +256,17 @@ class TrainingService:
         # Load data
         print("\nLoading data...")
         loader = DataLoader(self.db)
-        dataset = loader.load_multiple_series(series_configs)
+        if episode_ids:
+            dataset = loader.load_datasets(episode_ids=episode_ids)
+        else:
+            dataset = loader.load_multiple_series(series_configs)
+
+            # Limit samples if requested
+        if max_samples and len(dataset) > max_samples:
+            random.seed(self.config["random_seed"])
+            indices = random.sample(range(len(dataset)), max_samples)
+            dataset = dataset.select(indices)
+            print(f"   Limited to {max_samples} samples")
 
         # Split train/val
         random.seed(self.config["random_seed"])
@@ -227,8 +294,10 @@ class TrainingService:
                 "learning_rates": learning_rates[:epochs],
                 "gradient_clips": gradient_clips[:epochs],
                 "freeze_encoder": freeze_encoder[:epochs],
+                "freeze_decoder": freeze_decoder[:epochs],
                 "train_samples": len(train_data),
                 "val_samples": len(val_data),
+                "lora": False,
             },
             "epochs": [],
             "gradient_stats": []
@@ -256,34 +325,42 @@ class TrainingService:
         for ep in range(epochs):
             lr = learning_rates[ep] if ep < len(learning_rates) else learning_rates[-1]
             clip = gradient_clips[ep] if ep < len(gradient_clips) else gradient_clips[-1]
-            freeze = freeze_encoder[ep] if ep < len(freeze_encoder) else freeze_encoder[-1]
-            print(f"Epoch {ep + 1}: LR={lr}, Clip={clip}, Encoder={'FROZEN' if freeze else 'TRAINABLE'}")
+            enc_freeze = freeze_encoder[ep] if ep < len(freeze_encoder) else freeze_encoder[-1]
+            dec_freeze = freeze_decoder[ep] if ep < len(freeze_decoder) else freeze_decoder[-1]
+            print(f"Epoch {ep + 1}: LR={lr}, Clip={clip}, Encoder={'FROZEN' if enc_freeze else 'TRAINABLE'}, Decoder={'FROZEN' if dec_freeze else 'TRAINABLE'}")
         print("=" * 80)
 
         # Training loop
         for epoch in range(epochs):
             lr = learning_rates[epoch] if epoch < len(learning_rates) else learning_rates[-1]
             clip = gradient_clips[epoch] if epoch < len(gradient_clips) else gradient_clips[-1]
-            freeze = freeze_encoder[epoch] if epoch < len(freeze_encoder) else freeze_encoder[-1]
+            enc_freeze = freeze_encoder[epoch] if epoch < len(freeze_encoder) else freeze_encoder[-1]
+            dec_freeze = freeze_decoder[epoch] if epoch < len(freeze_decoder) else freeze_decoder[-1]
 
             print(f"\n{'=' * 80}")
             print(f"EPOCH {epoch + 1}/{epochs}")
             print(f"{'=' * 80}")
             print(f"   LR = {lr}")
             print(f"   Clip = {clip}")
-            print(f"   Encoder frozen = {freeze}")
+            print(f"   Encoder frozen = {enc_freeze}")
+            print(f"   Decoder frozen = {dec_freeze}")
 
-            # Freeze/unfreeze encoder
+            # Freeze/unfreeze encoder and decoder
             for p in self.model.model.encoder.parameters():
-                p.requires_grad = not freeze
+                p.requires_grad = not enc_freeze
             for p in self.model.model.decoder.parameters():
-                p.requires_grad = True
+                p.requires_grad = not dec_freeze
+
+            # Count trainable params
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.model.parameters())
+            print(f"   Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
             optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
                 lr=lr
             )
-            scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.amp.GradScaler('cuda')
 
             # Shuffle per epoch
             random.seed(self.config["random_seed"] + epoch)
@@ -314,7 +391,7 @@ class TrainingService:
                         skipped["long"] += 1
                         continue
 
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         out = self.model(input_features=inputs.input_features, labels=labels)
                         loss = out.loss
 
@@ -441,6 +518,256 @@ class TrainingService:
 
         return metrics_log
 
+    def train_lora(
+            self,
+            series_configs: List[Dict],
+            epochs: Optional[int] = None,
+            learning_rate: float = 1e-4,
+            gradient_clip: float = 0.5,
+            lora_rank: int = 16,
+            lora_alpha: int = 32,
+            lora_dropout: float = 0.05,
+            target_modules: Optional[List[str]] = None,
+            episode_ids: Optional[List[int]] = None,
+            max_samples: Optional[int] = None,
+    ) -> dict:
+
+        """Train with LoRA - freezes base model, only trains small adapters."""
+
+        if not PEFT_AVAILABLE:
+            raise ImportError("peft is not installed. Run: pip install peft")
+
+        epochs = epochs or self.config["epochs"]
+        target_modules = target_modules or self.lora_config["target_modules"]
+
+        # Create run directory
+        self.run_dir = self._create_run_dir(lora=True)
+
+        # Load model
+        self.load_model()
+
+        # Apply LoRA
+        print(f"\nApplying LoRA:")
+        print(f"   Rank: {lora_rank}")
+        print(f"   Alpha: {lora_alpha}")
+        print(f"   Dropout: {lora_dropout}")
+        print(f"   Target modules: {target_modules}")
+
+        lora_cfg = self._apply_lora(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+        )
+
+        # Load data
+        print("\nLoading data...")
+        loader = DataLoader(self.db)
+        if episode_ids:
+            dataset = loader.load_datasets(episode_ids=episode_ids)
+        else:
+            dataset = loader.load_multiple_series(series_configs)
+
+        # Limit samples if requested
+        if max_samples and len(dataset) > max_samples:
+            random.seed(self.config["random_seed"])
+            indices = random.sample(range(len(dataset)), max_samples)
+            dataset = dataset.select(indices)
+            print(f"   Limited to {max_samples} samples")
+
+
+
+        # Split train/val
+        random.seed(self.config["random_seed"])
+        indices = list(range(len(dataset)))
+        random.shuffle(indices)
+
+        val_size = int(len(indices) * self.config["validation_split"])
+        val_indices = indices[:val_size]
+        train_indices = indices[val_size:]
+
+        train_data = dataset.select(train_indices)
+        val_data = dataset.select(val_indices)
+
+        print(f"\nDataset split:")
+        print(f"   Training:   {len(train_data):,}")
+        print(f"   Validation: {len(val_data):,}")
+
+        # Metrics log
+        metrics_log = {
+            "config": {
+                "series_configs": series_configs,
+                "source_model": self.source_model,
+                "run_dir": str(self.run_dir),
+                "epochs": epochs,
+                "learning_rate": learning_rate,
+                "gradient_clip": gradient_clip,
+                "lora": True,
+                "lora_rank": lora_rank,
+                "lora_alpha": lora_alpha,
+                "lora_dropout": lora_dropout,
+                "target_modules": target_modules,
+                "train_samples": len(train_data),
+                "val_samples": len(val_data),
+            },
+            "epochs": [],
+        }
+
+        best_wer = float("inf")
+        best_series_wer = {}
+        global_step = 0
+
+        # Print config
+        print("\n" + "=" * 80)
+        print("LoRA TRAINING CONFIGURATION")
+        print("=" * 80)
+        print(f"Source model: {self.source_model}")
+        print(f"Learning rate: {learning_rate}")
+        print(f"Gradient clip: {gradient_clip}")
+        print(f"LoRA rank: {lora_rank}, alpha: {lora_alpha}")
+        print(f"Target modules: {target_modules}")
+        print(f"Epochs: {epochs}")
+        print("=" * 80)
+
+        # Single optimizer for all epochs (LoRA uses consistent LR)
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=learning_rate
+        )
+        scaler = torch.amp.GradScaler('cuda')
+
+        for epoch in range(epochs):
+            print(f"\n{'=' * 80}")
+            print(f"EPOCH {epoch + 1}/{epochs}")
+            print(f"{'=' * 80}")
+
+            # Shuffle per epoch
+            random.seed(self.config["random_seed"] + epoch)
+            epoch_indices = list(range(len(train_data)))
+            random.shuffle(epoch_indices)
+
+            epoch_losses = []
+            skipped = {"long": 0, "error": 0}
+            processed = 0
+
+            self.model.train()
+            bar = tqdm(epoch_indices, desc=f"LoRA Epoch {epoch + 1}/{epochs}", ncols=130)
+
+            for idx in bar:
+                sample = train_data[idx]
+
+                try:
+                    audio = sample["audio"]
+                    wav = torch.tensor(audio["array"]).float()
+                    sr = audio["sampling_rate"]
+                    text = sample["text"]
+
+                    inputs = self.processor(wav, sampling_rate=sr, return_tensors="pt").to(self.device)
+                    labels = self.processor.tokenizer(text, return_tensors="pt").input_ids.to(self.device)
+
+                    # Check max target positions - need base model config
+                    max_positions = getattr(self.model.config, 'max_target_positions', 448)
+                    if labels.shape[1] > max_positions:
+                        skipped["long"] += 1
+                        continue
+
+                    with torch.amp.autocast('cuda'):
+                        out = self.model(input_features=inputs.input_features, labels=labels)
+                        loss = out.loss
+
+                    optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), gradient_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    loss_val = loss.item()
+                    epoch_losses.append(loss_val)
+                    processed += 1
+                    global_step += 1
+
+                    if global_step % 50 == 0:
+                        bar.set_postfix({
+                            'loss': f"{loss_val:.3f}",
+                            'avg': f"{np.mean(epoch_losses):.3f}",
+                        })
+
+                except Exception as e:
+                    skipped["error"] += 1
+                    continue
+
+            print(f"\nLoss: Mean={np.mean(epoch_losses):.4f}, Median={np.median(epoch_losses):.4f}")
+            print(f"Processed: {processed}, Skipped: {sum(skipped.values())}")
+
+            # Validation
+            print("\nEvaluating...")
+            val_metrics, detailed_results = self._evaluate_comprehensive(val_data)
+
+            # Save best LoRA adapter
+            if val_metrics['wer']['mean'] < best_wer:
+                best_wer = val_metrics['wer']['mean']
+                best_dir = self.run_dir / "best"
+                best_dir.mkdir(exist_ok=True)
+                # Save only the LoRA adapter (small!)
+                self.model.save_pretrained(str(best_dir))
+                self.processor.save_pretrained(str(best_dir))
+                print(f"   Saved BEST LoRA adapter (WER: {best_wer:.4f})")
+
+            # Per-series best
+            if 'per_series' in val_metrics:
+                for series_name, series_metrics in val_metrics['per_series'].items():
+                    series_wer = series_metrics['wer_mean']
+                    if series_name not in best_series_wer or series_wer < best_series_wer[series_name]:
+                        best_series_wer[series_name] = series_wer
+                        print(f"   Best {series_name} WER: {series_wer:.4f}")
+
+            # Save epoch adapter
+            epoch_dir = self.run_dir / f"epoch_{epoch + 1:02d}"
+            epoch_dir.mkdir(exist_ok=True)
+            self.model.save_pretrained(str(epoch_dir))
+            self.processor.save_pretrained(str(epoch_dir))
+
+            metrics_log["epochs"].append({
+                "epoch": epoch + 1,
+                "loss": {"mean": float(np.mean(epoch_losses)), "median": float(np.median(epoch_losses))},
+                "validation_metrics": val_metrics,
+                "samples": {"processed": processed, "skipped": sum(skipped.values())}
+            })
+
+            with open(self.run_dir / "training_log.json", "w") as f:
+                json.dump(metrics_log, f, indent=2)
+
+        # Final save
+        final_dir = self.run_dir / "final"
+        final_dir.mkdir(exist_ok=True)
+        self.model.save_pretrained(str(final_dir))
+        self.processor.save_pretrained(str(final_dir))
+
+        # Also save merged model (base + LoRA combined)
+        print("\nMerging LoRA into base model...")
+        merged_dir = self.run_dir / "merged"
+        merged_dir.mkdir(exist_ok=True)
+        merged_model = self.model.merge_and_unload()
+        merged_model.save_pretrained(str(merged_dir))
+        self.processor.save_pretrained(str(merged_dir))
+        print(f"   Saved merged model to {merged_dir}")
+
+        print("\n" + "=" * 80)
+        print("LoRA TRAINING COMPLETE!")
+        print("=" * 80)
+        print(f"Run directory: {self.run_dir}")
+        print(f"Best WER: {best_wer:.4f}")
+        for series_name, s_wer in best_series_wer.items():
+            print(f"Best {series_name} WER: {s_wer:.4f}")
+        print(f"\nSaved:")
+        print(f"   {self.run_dir}/best      <- Best LoRA adapter (~MB)")
+        print(f"   {self.run_dir}/merged    <- Full merged model (use this for inference)")
+        print(f"   {self.run_dir}/final     <- Final LoRA adapter")
+        print("=" * 80)
+
+        return metrics_log
+
     def _compute_gradient_stats(self) -> dict:
         """Compute gradient statistics."""
         total_norm = 0.0
@@ -524,8 +851,9 @@ class TrainingService:
                     # Loss
                     try:
                         labels = self.processor.tokenizer(reference, return_tensors="pt").input_ids.to(self.device)
-                        if labels.shape[1] <= self.model.config.max_target_positions:
-                            with torch.cuda.amp.autocast():
+                        max_positions = getattr(self.model.config, 'max_target_positions', 448)
+                        if labels.shape[1] <= max_positions:
+                            with torch.amp.autocast('cuda'):
                                 out = self.model(input_features=inputs.input_features, labels=labels)
                                 loss = out.loss.item()
                             losses.append(loss)

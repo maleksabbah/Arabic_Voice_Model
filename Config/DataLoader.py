@@ -17,6 +17,7 @@ class DataLoader:
             series_id: Optional[int] = None,
             episode_ids: Optional[List[int]] = None,
             episode_numbers: Optional[List[int]] = None,
+            episode_names: Optional[List[str]] = None,
             skip_filtered: bool = True,
             min_duration: float = 0.5,
             max_duration: float = 30.0,
@@ -40,6 +41,8 @@ class DataLoader:
             query = query.filter(Chunk.episode_id.in_(episode_ids))
         if episode_numbers and series_id:
             query = query.filter(Episode.episode_number.in_(episode_numbers))
+        if episode_names and series_id:
+            query = query.filter(Episode.name.in_(episode_names))
 
         chunks = query.all()
 
