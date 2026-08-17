@@ -1,365 +1,315 @@
 """
-Production consensus pipeline.
-Runs 3-model consensus on ALL chunks with original_transcription,
-writes accepted transcriptions to the `transcription` column.
-
-Models:
-  1. Whisper Large V3 — from DB (original_transcription)
-  2. CodeSwitching — MohamedRashad/Arabic-Whisper-CodeSwitching-Edition
-  3. NVIDIA FastConformer — nvidia/stt_ar_fastconformer_hybrid_large_pc_v1.0
+Parallel two-model consensus pseudo-labeling pipeline.
+Runs Whisper Large V3 Turbo + NVIDIA FastConformer in parallel using threading,
+processes consensus per-chunk and writes to DB immediately.
 
 Usage:
-  # Set HF cache to D: drive first (one-time):
-  #   $env:HF_HOME = "D:\hf_cache"
-
-  # Run all series except 5-8:
-  python Consensus.py
-
-  # Run specific series:
-  python Consensus.py --series 9 10 11 12
-
-  # Dry run (no DB writes):
-  python Consensus.py --dry-run
-
-  # Resume from where you left off (skips chunks with transcription already set):
-  python Consensus.py --resume
+  python consensus.py --db /workspace/asr.db --series 1 2 3 4 5
+  python consensus.py --db /workspace/asr.db --series 1 --dry-run
+  python consensus.py --db /workspace/asr.db --series 1 --resume
 """
 import argparse
 import gc
 import os
-import time
-import torch
 import re
+import time
+import threading
+import queue
+import sqlite3
+
+import torch
 import Levenshtein
-
-import sys
-
-sys.path.insert(0, ".")
-
-from Config.Database import get_db
-from Training.Model import Episode, Chunk, Series
 
 ARABIC_DIACRITICS = set("\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0670\u0655")
 
 
-def normalize_arabic(text):
-    if not text:
+def normalize_arabic(t):
+    if not t:
         return ""
-    text = "".join(c for c in text if c not in ARABIC_DIACRITICS)
-    text = re.sub(r'[أإآٱ]', 'ا', text)
-    text = text.replace('ـ', '')
-    text = " ".join(text.split()).strip()
-    return text
+    t = "".join(c for c in t if c not in ARABIC_DIACRITICS)
+    t = re.sub(r'[أإآٱ]', 'ا', t)
+    t = t.replace('ـ', '')
+    return " ".join(t.split()).strip()
 
 
-def transcribe_whisper_sequential(model_name, chunks, label="model"):
-    """Transcribe chunks sequentially with Whisper pipeline. For 4GB GPU."""
-    from transformers import pipeline as hf_pipeline
+def get_chunks(db_path, series_ids, resume=False):
+    conn = sqlite3.connect(db_path)
+    ph = ",".join(str(s) for s in series_ids)
+    q = f"""SELECT c.id, c.file_path, c.filename, e.series_id, e.name
+            FROM chunks c JOIN episodes e ON c.episode_id = e.id
+            WHERE e.series_id IN ({ph})"""
+    if resume:
+        q += " AND (c.transcription IS NULL OR c.transcription = '')"
+    rows = conn.execute(q).fetchall()
+    conn.close()
+    return [{"id": r[0], "file_path": r[1], "filename": r[2],
+             "series_id": r[3], "episode_name": r[4]} for r in rows]
 
-    print(f"\n{'=' * 60}")
-    print(f"Loading: {model_name} [{label}] ({len(chunks)} chunks)")
-    print(f"{'=' * 60}")
 
-    pipe = hf_pipeline(
-        "automatic-speech-recognition",
-        model=model_name,
-        device="cuda",
-        torch_dtype=torch.float16,
-    )
+def whisper_worker(chunks, result_dict, model_size="large-v3-turbo", done_event=None):
+    """Run Whisper Turbo inference. Puts results in result_dict[chunk_id] = text."""
+    from faster_whisper import WhisperModel
 
-    results = {}
+    print(f"[WHISPER] Loading {model_size} (int8_float16)...")
+    model = WhisperModel(model_size, device="cuda:0", compute_type="int8_float16")
+    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks...")
+
     start = time.time()
     errors = 0
 
-    for i, chunk in enumerate(chunks):
+    for i, c in enumerate(chunks):
         try:
-            out = pipe(chunk.file_path, generate_kwargs={"language": "ar", "task": "transcribe"})
-            results[chunk.id] = out["text"]
+            segs, _ = model.transcribe(
+                c["file_path"],
+                language="ar",
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+            )
+            result_dict[c["id"]] = " ".join([s.text for s in segs]).strip()
         except Exception as e:
-            if "3000 mel" in str(e):
-                try:
-                    out = pipe(chunk.file_path, generate_kwargs={"language": "ar", "task": "transcribe"},
-                               return_timestamps=True)
-                    results[chunk.id] = out["text"]
-                except Exception as e2:
-                    results[chunk.id] = ""
-                    errors += 1
-            else:
-                results[chunk.id] = ""
-                errors += 1
+            result_dict[c["id"]] = ""
+            errors += 1
 
-        if i < 3 or (i + 1) % 100 == 0 or i == len(chunks) - 1:
-            elapsed = time.time() - start
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (len(chunks) - i - 1) / rate if rate > 0 else 0
-            text_preview = results.get(chunk.id, "")[:50]
-            print(
-                f"  [{i + 1}/{len(chunks)}] ({rate:.1f} chunks/s, ETA {eta / 60:.0f}m) ep{chunk.episode_id} {chunk.filename}: {text_preview}")
+        if (i + 1) % 1000 == 0 or i == len(chunks) - 1:
+            el = time.time() - start
+            rate = (i + 1) / el
+            eta = (len(chunks) - i - 1) / rate
+            print(f"  [WHISPER {i+1}/{len(chunks)}] {rate:.1f}/s ETA {eta/60:.0f}m err={errors}")
 
-    elapsed = time.time() - start
-    print(f"Completed {len(chunks)} chunks in {elapsed / 60:.1f}m ({errors} errors)")
-
-    del pipe
+    print(f"[WHISPER] Done in {(time.time()-start)/60:.1f}m ({errors} errors)")
+    del model
     gc.collect()
     torch.cuda.empty_cache()
-    return results
+    if done_event:
+        done_event.set()
 
 
-def transcribe_fastconformer_batch(model_name, chunks, label="conformer", batch_size=8):
-    """Transcribe chunks with FastConformer using native batch support."""
+def conformer_worker(chunks, result_dict, batch_size=64, done_event=None):
+    """Run FastConformer inference. Puts results in result_dict[chunk_id] = text."""
     import nemo.collections.asr as nemo_asr
 
-    print(f"\n{'=' * 60}")
-    print(f"Loading: {model_name} [{label}] ({len(chunks)} chunks)")
-    print(f"{'=' * 60}")
+    print(f"[CONFORMER] Loading model...")
+    m = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.from_pretrained(
+        "nvidia/stt_ar_fastconformer_hybrid_large_pc_v1.0"
+    )
+    m.change_decoding_strategy(decoder_type="ctc")
+    m.eval()
+    m.cuda()
+    print(f"[CONFORMER] Loaded. Processing {len(chunks)} chunks in batches of {batch_size}...")
 
-    asr_model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.from_pretrained(model_name)
-    asr_model.change_decoding_strategy(decoder_type="ctc")
-    asr_model.eval()
-    asr_model.cuda()
-
-    file_paths = [chunk.file_path for chunk in chunks]
-    results = {}
     start = time.time()
+    errors = 0
 
-    try:
-        outputs = asr_model.transcribe(file_paths, batch_size=batch_size)
-        if hasattr(outputs, 'text'):
-            texts = outputs.text
-        elif isinstance(outputs, list) and len(outputs) > 0:
-            if isinstance(outputs[0], str):
-                texts = outputs
-            else:
-                texts = [o.text if hasattr(o, 'text') else str(o) for o in outputs]
-        else:
-            texts = outputs
+    for bs in range(0, len(chunks), batch_size):
+        be = min(bs + batch_size, len(chunks))
+        batch_paths = [chunks[i]["file_path"] for i in range(bs, be)]
+        batch_chunks = chunks[bs:be]
 
-        for i, (chunk, text) in enumerate(zip(chunks, texts)):
-            results[chunk.id] = text
-            if i < 3 or (i + 1) % 100 == 0 or i == len(chunks) - 1:
-                print(f"  [{i + 1}/{len(chunks)}] ep{chunk.episode_id} {chunk.filename}: {text[:50]}")
-
-    except Exception as e:
-        print(f"  Batch failed: {e}")
-        print(f"  Falling back to sequential (batch_size=1)")
-        for i, chunk in enumerate(chunks):
-            try:
-                out = asr_model.transcribe([chunk.file_path])
-                if hasattr(out, 'text'):
-                    text = out.text[0]
-                elif isinstance(out, list):
-                    text = out[0] if isinstance(out[0], str) else out[0].text
+        try:
+            out = m.transcribe(batch_paths, batch_size=batch_size)
+            if hasattr(out, 'text'):
+                texts = out.text
+            elif isinstance(out, list) and len(out) > 0:
+                if isinstance(out[0], str):
+                    texts = out
                 else:
-                    text = str(out)
-                results[chunk.id] = text
-            except Exception as e2:
-                results[chunk.id] = ""
-            if i < 3 or (i + 1) % 100 == 0:
-                text_preview = results.get(chunk.id, "")[:50]
-                print(f"  [{i + 1}/{len(chunks)}] ep{chunk.episode_id} {chunk.filename}: {text_preview}")
+                    texts = [o.text if hasattr(o, 'text') else str(o) for o in out]
+            else:
+                texts = out
+            for c, t in zip(batch_chunks, texts):
+                result_dict[c["id"]] = t
+        except Exception as e:
+            errors += 1
+            print(f"  [CONFORMER] Batch fail at {bs}: {e}")
+            for c in batch_chunks:
+                try:
+                    o = m.transcribe([c["file_path"]])
+                    t = o.text[0] if hasattr(o, 'text') else (o[0] if isinstance(o[0], str) else str(o[0]))
+                    result_dict[c["id"]] = t
+                except:
+                    result_dict[c["id"]] = ""
 
-    elapsed = time.time() - start
-    print(f"Completed {len(chunks)} chunks in {elapsed / 60:.1f}m")
+        if be % 2000 == 0 or be == len(chunks):
+            el = time.time() - start
+            rate = be / el if el > 0 else 0
+            eta = (len(chunks) - be) / rate if rate > 0 else 0
+            print(f"  [CONFORMER {be}/{len(chunks)}] {rate:.1f}/s ETA {eta/60:.0f}m err={errors}")
 
-    del asr_model
+    print(f"[CONFORMER] Done in {(time.time()-start)/60:.1f}m ({errors} errors)")
+    del m
     gc.collect()
     torch.cuda.empty_cache()
-    return results
+    if done_event:
+        done_event.set()
 
 
-def run_consensus(chunks, cs_results, fc_results, max_distance=0.4):
-    """Run 3-model consensus and return list of result dicts."""
-    results = []
+def consensus_writer(chunks, whisper_results, conformer_results, db_path,
+                     max_distance=0.4, dry_run=False):
+    """
+    Wait for both models to finish each chunk, run consensus, write to DB immediately.
+    Polls results dicts until both have an entry for each chunk.
+    """
+    conn = None if dry_run else sqlite3.connect(db_path)
 
-    for chunk in chunks:
-        large_v3 = normalize_arabic(chunk.original_transcription)
-        cs = normalize_arabic(cs_results.get(chunk.id, ""))
-        fc = normalize_arabic(fc_results.get(chunk.id, ""))
+    accepted = 0
+    rejected = 0
+    total = len(chunks)
+    start = time.time()
+    last_print = 0
 
-        texts = {"large_v3": large_v3, "codeswitching": cs, "conformer": fc}
-        model_names = list(texts.keys())
+    for i, c in enumerate(chunks):
+        cid = c["id"]
 
-        distances = {}
-        agreements = []
-        for i in range(len(model_names)):
-            for j in range(i + 1, len(model_names)):
-                a, b = model_names[i], model_names[j]
-                ta, tb = texts[a], texts[b]
-                if not ta or not tb:
-                    distances[f"{a}_vs_{b}"] = 1.0
-                    continue
-                dist = Levenshtein.distance(ta, tb)
-                max_len = max(len(ta), len(tb))
-                ratio = dist / max_len if max_len > 0 else 1.0
-                distances[f"{a}_vs_{b}"] = ratio
-                if ratio <= max_distance:
-                    agreements.append((a, b))
+        # Wait for both models to have this chunk's result
+        while cid not in whisper_results or cid not in conformer_results:
+            time.sleep(0.01)
 
-        is_accepted = len(agreements) >= 1
-        all_agree = len(agreements) == 3
+        # Run consensus
+        wt = normalize_arabic(whisper_results[cid])
+        ct = normalize_arabic(conformer_results[cid])
 
-        best_model = None
-        best_score = float("inf")
-        for mn in texts:
-            if not texts[mn]:
-                continue
-            score = sum(v for k, v in distances.items() if mn in k)
-            count = sum(1 for k in distances if mn in k)
-            avg = score / count if count else 1.0
-            if avg < best_score:
-                best_score = avg
-                best_model = mn
-
-        # Use original (non-normalized) text for the best model
-        if best_model == "large_v3":
-            best_text = chunk.original_transcription
-        elif best_model == "codeswitching":
-            best_text = cs_results.get(chunk.id, "")
+        if not wt or not ct:
+            is_accepted = False
+            best_text = ""
+            dist = 1.0
         else:
-            best_text = fc_results.get(chunk.id, "")
+            d = Levenshtein.distance(wt, ct)
+            ml = max(len(wt), len(ct))
+            dist = d / ml if ml > 0 else 1.0
+            is_accepted = dist <= max_distance
+            best_text = whisper_results[cid] if is_accepted else ""
 
-        results.append({
-            "chunk": chunk,
-            "accepted": is_accepted,
-            "all_agree": all_agree,
-            "best_model": best_model,
-            "best_text": best_text,
-            "num_agreements": len(agreements),
-            "distances": distances,
-        })
+        # Write immediately to DB
+        if not dry_run:
+            if is_accepted:
+                conn.execute(
+                    "UPDATE chunks SET transcription = ? WHERE id = ?",
+                    (best_text, cid)
+                )
+                accepted += 1
+            else:
+                conn.execute(
+                    "UPDATE chunks SET transcription = '', was_filtered = 1, filter_reason = ? WHERE id = ?",
+                    (f"dist>{max_distance}", cid)
+                )
+                rejected += 1
 
-    return results
+            # Commit every 500 chunks
+            if (i + 1) % 500 == 0:
+                conn.commit()
+        else:
+            if is_accepted:
+                accepted += 1
+            else:
+                rejected += 1
+
+        # Free memory — remove processed results
+        del whisper_results[cid]
+        del conformer_results[cid]
+
+        # Print progress
+        if (i + 1) % 1000 == 0 or i == total - 1:
+            el = time.time() - start
+            rate = (i + 1) / el
+            eta = (total - i - 1) / rate if rate > 0 else 0
+            pct_acc = 100 * accepted / (i + 1)
+            print(f"  [CONSENSUS {i+1}/{total}] acc={accepted} rej={rejected} ({pct_acc:.0f}%) {rate:.1f}/s ETA {eta/60:.0f}m")
+
+    # Final commit
+    if not dry_run and conn:
+        conn.commit()
+        conn.close()
+
+    return accepted, rejected
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Production consensus pipeline")
-    parser.add_argument("--series", type=int, nargs="+", default=None)
-    parser.add_argument("--exclude", type=int, nargs="+", default=[5, 6, 7, 8])
-    parser.add_argument("--max-distance", type=float, default=0.4)
-    parser.add_argument("--dry-run", action="store_true", help="Don't write to DB")
-    parser.add_argument("--resume", action="store_true", help="Skip chunks already transcribed")
-    parser.add_argument("--batch-size", type=int, default=8, help="FastConformer batch size")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Parallel two-model consensus pipeline")
+    p.add_argument("--db", required=True)
+    p.add_argument("--series", type=int, nargs="+", required=True)
+    p.add_argument("--max-distance", type=float, default=0.4)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--whisper-model", default="large-v3-turbo")
+    a = p.parse_args()
 
-    db = next(get_db())
-
-    # Determine series
-    if args.series:
-        series_ids = args.series
-    else:
-        all_series = db.query(Series).all()
-        series_ids = [s.id for s in all_series if s.id not in args.exclude]
-
-    # Print series info
     print("=" * 60)
-    print("PRODUCTION CONSENSUS PIPELINE")
+    print("PARALLEL TWO-MODEL CONSENSUS PIPELINE")
     print("=" * 60)
-    for sid in series_ids:
-        s = db.query(Series).filter(Series.id == sid).first()
-        if s:
-            count = (
-                db.query(Chunk)
-                .join(Episode)
-                .filter(Episode.series_id == sid, Chunk.original_transcription.isnot(None))
-                .count()
-            )
-            print(f"  Series {sid}: {s.name} — {count} chunks")
+    print(f"DB: {a.db}")
+    print(f"Models: Whisper {a.whisper_model} (int8_float16) + FastConformer")
+    print(f"Series: {a.series}")
+    print(f"Threshold: {a.max_distance}")
+    print(f"Batch size (conformer): {a.batch_size}")
+    print(f"Dry run: {a.dry_run}")
+    print(f"Resume: {a.resume}")
+    print()
 
-    # Get all chunks
-    query = (
-        db.query(Chunk)
-        .join(Episode)
-        .filter(
-            Episode.series_id.in_(series_ids),
-            Chunk.original_transcription.isnot(None),
-        )
-    )
-    if args.resume:
-        query = query.filter(Chunk.transcription.is_(None))
-
-    all_chunks = query.all()
-
-    if not all_chunks:
-        print("\nNo chunks to process!")
+    # Get chunks
+    chunks = get_chunks(a.db, a.series, a.resume)
+    if not chunks:
+        print("No chunks to process!")
         return
 
-    print(f"\nTotal chunks to process: {len(all_chunks)}")
-    print(f"Threshold: {args.max_distance}")
-    print(f"Dry run: {args.dry_run}")
-    print(f"Resume mode: {args.resume}")
+    # Check files exist
+    missing = [c for c in chunks if not os.path.exists(c["file_path"])]
+    if missing:
+        print(f"WARNING: {len(missing)} missing files! Example: {missing[0]['file_path']}")
+        chunks = [c for c in chunks if os.path.exists(c["file_path"])]
 
-    total_start = time.time()
+    # Per-series stats
+    sc = {}
+    for c in chunks:
+        sc[c["series_id"]] = sc.get(c["series_id"], 0) + 1
+    for sid, cnt in sorted(sc.items()):
+        print(f"  Series {sid}: {cnt}")
+    print(f"  Total: {len(chunks)}")
+    print()
 
-    # Model 2: CodeSwitching (sequential, ~3min/100 chunks)
-    cs_results = transcribe_whisper_sequential(
-        "MohamedRashad/Arabic-Whisper-CodeSwitching-Edition",
-        all_chunks,
-        "codeswitching",
+    # Shared result dicts (thread-safe for single-writer-per-key)
+    whisper_results = {}
+    conformer_results = {}
+
+    t0 = time.time()
+
+    # Launch both models in parallel threads
+    print("Launching both models in parallel...")
+    w_thread = threading.Thread(
+        target=whisper_worker,
+        args=(chunks, whisper_results, a.whisper_model)
+    )
+    c_thread = threading.Thread(
+        target=conformer_worker,
+        args=(chunks, conformer_results, a.batch_size)
     )
 
-    # Model 3: FastConformer (batched, fast)
-    fc_results = transcribe_fastconformer_batch(
-        "nvidia/stt_ar_fastconformer_hybrid_large_pc_v1.0",
-        all_chunks,
-        "conformer",
-        batch_size=args.batch_size,
+    w_thread.start()
+    c_thread.start()
+
+    # Run consensus writer in main thread — processes chunks as results come in
+    accepted, rejected = consensus_writer(
+        chunks, whisper_results, conformer_results,
+        a.db, a.max_distance, a.dry_run
     )
 
-    # Run consensus
-    print(f"\n{'=' * 60}")
-    print(f"3-MODEL CONSENSUS (threshold={args.max_distance})")
-    print(f"{'=' * 60}\n")
-
-    consensus_results = run_consensus(all_chunks, cs_results, fc_results, args.max_distance)
-
-    # Stats
-    accepted = [r for r in consensus_results if r["accepted"]]
-    rejected = [r for r in consensus_results if not r["accepted"]]
-    all_agree = [r for r in consensus_results if r["all_agree"]]
-
-    # Per-series breakdown
-    series_stats = {}
-    for r in consensus_results:
-        sid = r["chunk"].episode.series_id if hasattr(r["chunk"], 'episode') else "?"
-        if sid not in series_stats:
-            series_stats[sid] = {"total": 0, "accepted": 0, "all_agree": 0}
-        series_stats[sid]["total"] += 1
-        if r["accepted"]:
-            series_stats[sid]["accepted"] += 1
-        if r["all_agree"]:
-            series_stats[sid]["all_agree"] += 1
-
-    for sid, stats in sorted(series_stats.items()):
-        s = db.query(Series).filter(Series.id == sid).first()
-        name = s.name if s else f"Series {sid}"
-        pct = 100 * stats["accepted"] / stats["total"] if stats["total"] else 0
-        print(f"  {name}: {stats['accepted']}/{stats['total']} accepted ({pct:.0f}%)")
-
-    # Write to DB
-    if not args.dry_run:
-        for r in accepted:
-            r["chunk"].transcription = r["best_text"]
-        for r in rejected:
-            r["chunk"].transcription = ""
-        db.commit()
-        print(f"\nWrote {len(accepted)} accepted, {len(rejected)} rejected (set to empty).")
-    else:
-        print(f"\n[DRY RUN] Would write {len(accepted)} transcriptions to DB.")
+    # Wait for model threads to fully finish
+    w_thread.join()
+    c_thread.join()
 
     # Summary
-    total_elapsed = time.time() - total_start
-    total = len(consensus_results)
-
-    print(f"\n{'=' * 60}")
+    total = len(chunks)
+    el = time.time() - t0
+    print(f"\n{'='*60}")
     print(f"SUMMARY")
-    print(f"{'=' * 60}")
-    print(f"Total chunks:     {total}")
-    print(f"Accepted:         {len(accepted)} ({100 * len(accepted) / total:.0f}%)")
-    print(f"All 3 agree:      {len(all_agree)} ({100 * len(all_agree) / total:.0f}%)")
-    print(f"Rejected:         {len(rejected)} ({100 * len(rejected) / total:.0f}%)")
-    print(f"Total time:       {total_elapsed / 60:.1f} minutes")
-    print(f"Rate:             {total / (total_elapsed / 60):.0f} chunks/minute")
-    print(f"{'=' * 60}")
+    print(f"{'='*60}")
+    print(f"Total chunks:  {total}")
+    print(f"Accepted:      {accepted} ({100*accepted/total:.0f}%)")
+    print(f"Rejected:      {rejected} ({100*rejected/total:.0f}%)")
+    print(f"Total time:    {el/60:.1f} minutes ({el/3600:.1f} hours)")
+    print(f"Rate:          {total/el:.1f} chunks/second")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
