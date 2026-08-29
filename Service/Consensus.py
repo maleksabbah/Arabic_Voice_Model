@@ -45,37 +45,52 @@ def get_chunks(db_path, series_ids, phase="all"):
     conn.close()
     return [{"id":r[0],"file_path":r[1],"filename":r[2],"series_id":r[3]} for r in rows]
 
-def run_whisper(chunks, db_path, file_batch=32):
+def run_whisper(chunks, db_path, num_workers=8):
     from faster_whisper import WhisperModel
     print(f"[WHISPER] Loading large-v3-turbo...")
     model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
-    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks, file_batch={file_batch}")
+    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks, workers={num_workers}")
 
-    conn = sqlite3.connect(db_path)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    db_lock = threading.Lock()
     t0 = time.time()
     errs = 0
     done = 0
+    counter_lock = threading.Lock()
 
-    for batch_start in range(0, len(chunks), file_batch):
-        batch_end = min(batch_start + file_batch, len(chunks))
-        batch = chunks[batch_start:batch_end]
-
-        for c in batch:
-            try:
-                segs, _ = model.transcribe(c["file_path"], language="ar", beam_size=5, vad_filter=True)
-                text = " ".join([s.text for s in segs]).strip()
+    def process_chunk(c):
+        nonlocal errs, done
+        try:
+            segs, _ = model.transcribe(c["file_path"], language="ar", beam_size=5, vad_filter=True)
+            text = " ".join([s.text for s in segs]).strip()
+            with db_lock:
                 conn.execute("UPDATE chunks SET whisper_text=? WHERE id=?", (text, c["id"]))
-            except:
+        except:
+            with db_lock:
                 conn.execute("UPDATE chunks SET whisper_text='' WHERE id=?", (c["id"],))
+            with counter_lock:
                 errs += 1
+        with counter_lock:
             done += 1
-
-        conn.commit()
-        if done % 200 == 0 or done == len(chunks):
+            d = done
+        if d % 200 == 0:
+            with db_lock:
+                conn.commit()
             el = time.time()-t0
-            r = done/el if el > 0 else 0
-            eta = (len(chunks)-done)/r if r > 0 else 0
-            print(f"  [WHISPER {done}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs}")
+            r = d/el if el > 0 else 0
+            eta = (len(chunks)-d)/r if r > 0 else 0
+            print(f"  [WHISPER {d}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs}")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_chunk, c) for c in chunks]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except:
+                pass
 
     conn.commit()
     conn.close()
@@ -182,25 +197,43 @@ def main():
     print(f"DB: {a.db} | Series: {a.series} | Phase: {a.phase} | Threshold: {a.max_distance}")
     ensure_columns(a.db)
 
-    if a.phase in ("all", "whisper"):
+    if a.phase == "all":
+        w_chunks = get_chunks(a.db, a.series, phase="whisper")
+        c_chunks = get_chunks(a.db, a.series, phase="conformer")
+        w_chunks = [c for c in w_chunks if os.path.exists(c["file_path"])]
+        c_chunks = [c for c in c_chunks if os.path.exists(c["file_path"])]
+
+        threads = []
+        if w_chunks:
+            print(f"\n=== WHISPER ({len(w_chunks)} chunks) ===")
+            wt = threading.Thread(target=run_whisper, args=(w_chunks, a.db))
+            threads.append(wt)
+        else:
+            print("Whisper: all chunks already processed")
+
+        if c_chunks:
+            print(f"=== CONFORMER ({len(c_chunks)} chunks) ===")
+            ct = threading.Thread(target=run_conformer, args=(c_chunks, a.db, a.batch_size))
+            threads.append(ct)
+        else:
+            print("Conformer: all chunks already processed")
+
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+    elif a.phase == "whisper":
         chunks = get_chunks(a.db, a.series, phase="whisper")
+        chunks = [c for c in chunks if os.path.exists(c["file_path"])]
         if chunks:
-            missing = [c for c in chunks if not os.path.exists(c["file_path"])]
-            if missing:
-                print(f"WARNING: {len(missing)} missing files")
-                chunks = [c for c in chunks if os.path.exists(c["file_path"])]
             print(f"\n=== PHASE 1: WHISPER ({len(chunks)} chunks) ===")
             run_whisper(chunks, a.db)
         else:
             print("Whisper: all chunks already processed")
 
-    if a.phase in ("all", "conformer"):
+    elif a.phase == "conformer":
         chunks = get_chunks(a.db, a.series, phase="conformer")
+        chunks = [c for c in chunks if os.path.exists(c["file_path"])]
         if chunks:
-            missing = [c for c in chunks if not os.path.exists(c["file_path"])]
-            if missing:
-                print(f"WARNING: {len(missing)} missing files")
-                chunks = [c for c in chunks if os.path.exists(c["file_path"])]
             print(f"\n=== PHASE 2: CONFORMER ({len(chunks)} chunks) ===")
             run_conformer(chunks, a.db, a.batch_size)
         else:
