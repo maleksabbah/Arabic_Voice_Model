@@ -1,4 +1,15 @@
-import argparse, gc, os, re, time, threading, sqlite3, torch, Levenshtein
+"""
+Consensus v4 — Batched Whisper + NeMo Conformer, intermediate saves per model.
+Three phases: 1) Whisper batched inference → save to DB, 2) Conformer batched inference → save to DB, 3) Consensus pass → final labels.
+Each phase saves independently so no work is lost.
+
+Usage:
+  python Service/Consensus.py --db /workspace/asr.db --series 1 2 3 --batch-size 64
+  python Service/Consensus.py --db /workspace/asr.db --series 1 2 3 --phase whisper
+  python Service/Consensus.py --db /workspace/asr.db --series 1 2 3 --phase conformer
+  python Service/Consensus.py --db /workspace/asr.db --series 1 2 3 --phase consensus
+"""
+import argparse, gc, os, re, time, sqlite3, torch, Levenshtein
 
 DIACRITICS = set("\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0670\u0655")
 
@@ -9,120 +20,208 @@ def norm(t):
     t = t.replace('ـ', '')
     return " ".join(t.split()).strip()
 
-def get_chunks(db, sids, resume=False):
-    conn = sqlite3.connect(db)
-    ph = ",".join(str(s) for s in sids)
-    q = f"SELECT c.id,c.file_path,c.filename,e.series_id FROM chunks c JOIN episodes e ON c.episode_id=e.id WHERE e.series_id IN ({ph})"
-    if resume: q += " AND (c.transcription IS NULL OR c.transcription='')"
+def ensure_columns(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN whisper_text TEXT")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN conformer_text TEXT")
+    except: pass
+    conn.commit()
+    conn.close()
+
+def get_chunks(db_path, series_ids, phase="all"):
+    conn = sqlite3.connect(db_path)
+    ph = ",".join(str(s) for s in series_ids)
+    q = f"SELECT c.id, c.file_path, c.filename, e.series_id FROM chunks c JOIN episodes e ON c.episode_id=e.id WHERE e.series_id IN ({ph})"
+    if phase == "whisper":
+        q += " AND (c.whisper_text IS NULL)"
+    elif phase == "conformer":
+        q += " AND (c.conformer_text IS NULL)"
+    elif phase == "consensus":
+        q += " AND c.whisper_text IS NOT NULL AND c.conformer_text IS NOT NULL AND (c.transcription IS NULL OR c.transcription = '')"
     rows = conn.execute(q).fetchall()
     conn.close()
     return [{"id":r[0],"file_path":r[1],"filename":r[2],"series_id":r[3]} for r in rows]
 
-def whisper_worker(chunks, res):
-    from faster_whisper import WhisperModel
-    print("[WHISPER] Loading...")
-    m = WhisperModel("large-v3-turbo", device="cuda", compute_type="int8_float16")
-    print(f"[WHISPER] Loaded. {len(chunks)} chunks")
-    t0 = time.time(); errs = 0
+def run_whisper(chunks, db_path):
+    from faster_whisper import WhisperModel, BatchedInferencePipeline
+    print(f"[WHISPER] Loading large-v3-turbo...")
+    model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
+    pipeline = BatchedInferencePipeline(model=model)
+    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks with batched inference...")
+
+    conn = sqlite3.connect(db_path)
+    t0 = time.time()
+    errs = 0
+    saved = 0
+
     for i, c in enumerate(chunks):
         try:
-            segs, _ = m.transcribe(c["file_path"], language="ar", beam_size=5, vad_filter=True)
-            res[c["id"]] = " ".join([s.text for s in segs]).strip()
-        except:
-            res[c["id"]] = ""; errs += 1
-        if (i+1) % 1000 == 0 or i == len(chunks)-1:
-            el = time.time()-t0; r = (i+1)/el; eta = (len(chunks)-i-1)/r
-            print(f"  [WHISPER {i+1}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs}")
-    print(f"[WHISPER] Done {(time.time()-t0)/60:.1f}m")
-    del m; gc.collect(); torch.cuda.empty_cache()
+            segments, _ = pipeline.transcribe(c["file_path"], language="ar", beam_size=5, batch_size=16)
+            text = " ".join([s.text for s in segments]).strip()
+            conn.execute("UPDATE chunks SET whisper_text=? WHERE id=?", (text, c["id"]))
+        except Exception as e:
+            conn.execute("UPDATE chunks SET whisper_text='' WHERE id=?", (c["id"],))
+            errs += 1
 
-def conformer_worker(chunks, res, bs=64):
+        if (i+1) % 200 == 0:
+            conn.commit()
+            saved = i+1
+            el = time.time()-t0
+            r = (i+1)/el
+            eta = (len(chunks)-i-1)/r
+            print(f"  [WHISPER {i+1}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs} saved={saved}")
+
+    conn.commit()
+    conn.close()
+    el = time.time()-t0
+    print(f"[WHISPER] Done in {el/60:.1f}m. {len(chunks)} chunks, {errs} errors")
+    del model, pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def run_conformer(chunks, db_path, batch_size=64):
     import nemo.collections.asr as nemo_asr
-    print("[CONFORMER] Loading...")
+    print(f"[CONFORMER] Loading...")
     m = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.from_pretrained("nvidia/stt_ar_fastconformer_hybrid_large_pc_v1.0")
     m.change_decoding_strategy(decoder_type="ctc")
     m.eval()
     m.cuda()
-    print(f"[CONFORMER] Loaded. {len(chunks)} chunks, batch={bs}")
-    t0 = time.time()
+    print(f"[CONFORMER] Loaded. Processing {len(chunks)} chunks, batch={batch_size}")
+
+    conn = sqlite3.connect(db_path)
     all_paths = [c["file_path"] for c in chunks]
+    t0 = time.time()
+
     try:
-        out = m.transcribe(all_paths, batch_size=bs)
+        out = m.transcribe(all_paths, batch_size=batch_size)
         if hasattr(out, 'text'):
             texts = out.text
         elif isinstance(out, list) and len(out) > 0:
             texts = out if isinstance(out[0], str) else [o.text if hasattr(o, 'text') else str(o) for o in out]
         else:
             texts = out
-        for c, t in zip(chunks, texts):
-            res[c["id"]] = t
-            if len(res) % 2000 == 0:
-                el = time.time()-t0; r = len(res)/el
-                print(f"  [CONFORMER {len(res)}/{len(chunks)}] {r:.1f}/s ETA {(len(chunks)-len(res))/r/60:.0f}m")
+
+        for i, (c, t) in enumerate(zip(chunks, texts)):
+            conn.execute("UPDATE chunks SET conformer_text=? WHERE id=?", (t, c["id"]))
+            if (i+1) % 1000 == 0:
+                conn.commit()
+                el = time.time()-t0
+                r = (i+1)/el
+                print(f"  [CONFORMER {i+1}/{len(chunks)}] {r:.1f}/s ETA {(len(chunks)-i-1)/r/60:.0f}m saved={i+1}")
+
     except Exception as e:
         print(f"[CONFORMER] Failed: {e}")
-        for c in chunks: res[c["id"]] = ""
-    print(f"[CONFORMER] Done {(time.time()-t0)/60:.1f}m")
-    del m; gc.collect(); torch.cuda.empty_cache()
+        for c in chunks:
+            conn.execute("UPDATE chunks SET conformer_text='' WHERE id=?", (c["id"],))
 
-def consensus_writer(chunks, wr, cr, db_path, max_d=0.4, dry=False):
-    conn = None if dry else sqlite3.connect(db_path)
-    acc = rej = 0; t0 = time.time()
-    for i, c in enumerate(chunks):
-        cid = c["id"]
-        while cid not in wr or cid not in cr: time.sleep(0.01)
-        wt = norm(wr.get(cid,"")); ct = norm(cr.get(cid,""))
+    conn.commit()
+    conn.close()
+    el = time.time()-t0
+    print(f"[CONFORMER] Done in {el/60:.1f}m")
+    del m
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def run_consensus(chunks, db_path, max_distance=0.4):
+    print(f"[CONSENSUS] Processing {len(chunks)} chunks, threshold={max_distance}")
+    conn = sqlite3.connect(db_path)
+    t0 = time.time()
+    acc = rej = 0
+
+    rows = conn.execute(
+        f"SELECT id, whisper_text, conformer_text FROM chunks WHERE id IN ({','.join(str(c['id']) for c in chunks)})"
+    ).fetchall()
+
+    for r in rows:
+        cid, wt, ct = r[0], norm(r[1] or ""), norm(r[2] or "")
         if not wt or not ct:
-            ok = False; best = ""
+            conn.execute("UPDATE chunks SET transcription='', was_filtered=1, filter_reason=? WHERE id=?",
+                        (f"empty_model_output", cid))
+            rej += 1
+            continue
+
+        d = Levenshtein.distance(wt, ct)
+        ml = max(len(wt), len(ct))
+        dist = d/ml if ml > 0 else 1.0
+
+        if dist <= max_distance:
+            conn.execute("UPDATE chunks SET transcription=? WHERE id=?", (r[1], cid))
+            acc += 1
         else:
-            d = Levenshtein.distance(wt, ct); ml = max(len(wt),len(ct))
-            dist = d/ml if ml>0 else 1.0; ok = dist <= max_d
-            best = wr[cid] if ok else ""
-        if not dry:
-            if ok:
-                conn.execute("UPDATE chunks SET transcription=? WHERE id=?", (best, cid)); acc += 1
-            else:
-                conn.execute("UPDATE chunks SET transcription='',was_filtered=1,filter_reason=? WHERE id=?", (f"dist>{max_d}", cid)); rej += 1
-            if (i+1) % 500 == 0: conn.commit()
-        else:
-            acc += 1 if ok else 0; rej += 0 if ok else 1
-        if cid in wr: del wr[cid]
-        if cid in cr: del cr[cid]
-        if (i+1) % 1000 == 0 or i == len(chunks)-1:
-            el = time.time()-t0; r = (i+1)/el; pct = 100*acc/(i+1)
-            print(f"  [CONSENSUS {i+1}/{len(chunks)}] acc={acc} rej={rej} ({pct:.0f}%) {r:.1f}/s ETA {(len(chunks)-i-1)/r/60:.0f}m")
-    if not dry and conn: conn.commit(); conn.close()
-    return acc, rej
+            conn.execute("UPDATE chunks SET transcription='', was_filtered=1, filter_reason=? WHERE id=?",
+                        (f"dist>{max_distance}:{dist:.3f}", cid))
+            rej += 1
+
+        if (acc+rej) % 1000 == 0:
+            conn.commit()
+            pct = 100*acc/(acc+rej) if (acc+rej) > 0 else 0
+            print(f"  [CONSENSUS {acc+rej}/{len(rows)}] acc={acc} rej={rej} ({pct:.0f}%)")
+
+    conn.commit()
+    conn.close()
+    el = time.time()-t0
+    tot = acc+rej
+    pct = 100*acc/tot if tot > 0 else 0
+    print(f"[CONSENSUS] Done in {el/60:.1f}m | Accepted: {acc} ({pct:.0f}%) | Rejected: {rej}")
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--db", required=True)
     p.add_argument("--series", type=int, nargs="+", required=True)
     p.add_argument("--max-distance", type=float, default=0.4)
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--resume", action="store_true")
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--phase", choices=["all","whisper","conformer","consensus"], default="all")
     a = p.parse_args()
-    print(f"DB: {a.db} | Series: {a.series} | Threshold: {a.max_distance} | Resume: {a.resume}")
-    chunks = get_chunks(a.db, a.series, a.resume)
-    if not chunks: print("No chunks!"); return
-    missing = [c for c in chunks if not os.path.exists(c["file_path"])]
-    if missing:
-        print(f"WARNING: {len(missing)} missing files")
-        chunks = [c for c in chunks if os.path.exists(c["file_path"])]
-    sc = {}
-    for c in chunks: sc[c["series_id"]] = sc.get(c["series_id"],0)+1
-    for sid,cnt in sorted(sc.items()): print(f"  Series {sid}: {cnt}")
-    print(f"  Total: {len(chunks)}")
-    t0 = time.time()
-    wr = {}; cr = {}
-    wt = threading.Thread(target=whisper_worker, args=(chunks, wr))
-    ct = threading.Thread(target=conformer_worker, args=(chunks, cr, a.batch_size))
-    wt.start(); ct.start()
-    acc, rej = consensus_writer(chunks, wr, cr, a.db, a.max_distance, a.dry_run)
-    wt.join(); ct.join()
-    el = time.time()-t0; tot = len(chunks)
-    print(f"\nTotal: {tot} | Accepted: {acc} ({100*acc/tot:.0f}%) | Rejected: {rej} ({100*rej/tot:.0f}%) | Time: {el/60:.1f}m ({el/3600:.1f}h)")
+
+    print(f"DB: {a.db} | Series: {a.series} | Phase: {a.phase} | Threshold: {a.max_distance}")
+    ensure_columns(a.db)
+
+    if a.phase in ("all", "whisper"):
+        chunks = get_chunks(a.db, a.series, phase="whisper")
+        if chunks:
+            missing = [c for c in chunks if not os.path.exists(c["file_path"])]
+            if missing:
+                print(f"WARNING: {len(missing)} missing files")
+                chunks = [c for c in chunks if os.path.exists(c["file_path"])]
+            print(f"\n=== PHASE 1: WHISPER ({len(chunks)} chunks) ===")
+            run_whisper(chunks, a.db)
+        else:
+            print("Whisper: all chunks already processed")
+
+    if a.phase in ("all", "conformer"):
+        chunks = get_chunks(a.db, a.series, phase="conformer")
+        if chunks:
+            missing = [c for c in chunks if not os.path.exists(c["file_path"])]
+            if missing:
+                print(f"WARNING: {len(missing)} missing files")
+                chunks = [c for c in chunks if os.path.exists(c["file_path"])]
+            print(f"\n=== PHASE 2: CONFORMER ({len(chunks)} chunks) ===")
+            run_conformer(chunks, a.db, a.batch_size)
+        else:
+            print("Conformer: all chunks already processed")
+
+    if a.phase in ("all", "consensus"):
+        chunks = get_chunks(a.db, a.series, phase="consensus")
+        if chunks:
+            print(f"\n=== PHASE 3: CONSENSUS ({len(chunks)} chunks) ===")
+            run_consensus(chunks, a.db, a.max_distance)
+        else:
+            print("Consensus: no chunks ready (need both whisper + conformer results)")
+
+    # Summary
+    conn = sqlite3.connect(a.db)
+    ph = ",".join(str(s) for s in a.series)
+    total = conn.execute(f"SELECT COUNT(*) FROM chunks c JOIN episodes e ON c.episode_id=e.id WHERE e.series_id IN ({ph})").fetchone()[0]
+    w_done = conn.execute(f"SELECT COUNT(*) FROM chunks c JOIN episodes e ON c.episode_id=e.id WHERE e.series_id IN ({ph}) AND c.whisper_text IS NOT NULL").fetchone()[0]
+    c_done = conn.execute(f"SELECT COUNT(*) FROM chunks c JOIN episodes e ON c.episode_id=e.id WHERE e.series_id IN ({ph}) AND c.conformer_text IS NOT NULL").fetchone()[0]
+    labeled = conn.execute(f"SELECT COUNT(*) FROM chunks c JOIN episodes e ON c.episode_id=e.id WHERE e.series_id IN ({ph}) AND c.transcription IS NOT NULL AND c.transcription != ''").fetchone()[0]
+    conn.close()
+    print(f"\n{'='*60}")
+    print(f"PROGRESS: Total={total} | Whisper={w_done} | Conformer={c_done} | Labeled={labeled}")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     main()
