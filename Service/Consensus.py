@@ -45,58 +45,58 @@ def get_chunks(db_path, series_ids, phase="all"):
     conn.close()
     return [{"id":r[0],"file_path":r[1],"filename":r[2],"series_id":r[3]} for r in rows]
 
-def run_whisper(chunks, db_path, num_workers=8):
-    from faster_whisper import WhisperModel
-    print(f"[WHISPER] Loading large-v3-turbo...")
-    model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
-    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks, workers={num_workers}")
+def run_whisper(chunks, db_path, batch_size=32):
+    from transformers import pipeline
+    print(f"[WHISPER] Loading large-v3-turbo via HuggingFace pipeline...")
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model="openai/whisper-large-v3-turbo",
+        torch_dtype=torch.float16,
+        device="cuda",
+    )
+    pipe.model.config.forced_decoder_ids = pipe.tokenizer.get_decoder_prompt_ids(language="ar", task="transcribe")
+    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks, batch_size={batch_size}")
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import threading
-
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    db_lock = threading.Lock()
+    conn = sqlite3.connect(db_path)
     t0 = time.time()
     errs = 0
     done = 0
-    counter_lock = threading.Lock()
 
-    def process_chunk(c):
-        nonlocal errs, done
+    for batch_start in range(0, len(chunks), batch_size):
+        batch_end = min(batch_start + batch_size, len(chunks))
+        batch = chunks[batch_start:batch_end]
+        paths = [c["file_path"] for c in batch]
+
         try:
-            segs, _ = model.transcribe(c["file_path"], language="ar", beam_size=5, vad_filter=True)
-            text = " ".join([s.text for s in segs]).strip()
-            with db_lock:
+            results = pipe(paths, batch_size=batch_size, generate_kwargs={"language": "ar", "task": "transcribe"})
+            for c, r in zip(batch, results):
+                text = r["text"].strip() if r and "text" in r else ""
                 conn.execute("UPDATE chunks SET whisper_text=? WHERE id=?", (text, c["id"]))
-        except:
-            with db_lock:
-                conn.execute("UPDATE chunks SET whisper_text='' WHERE id=?", (c["id"],))
-            with counter_lock:
-                errs += 1
-        with counter_lock:
-            done += 1
-            d = done
-        if d % 200 == 0:
-            with db_lock:
-                conn.commit()
-            el = time.time()-t0
-            r = d/el if el > 0 else 0
-            eta = (len(chunks)-d)/r if r > 0 else 0
-            print(f"  [WHISPER {d}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs}")
+                done += 1
+        except Exception as e:
+            print(f"  [WHISPER] Batch fail at {batch_start}: {e}")
+            for c in batch:
+                try:
+                    r = pipe(c["file_path"], generate_kwargs={"language": "ar", "task": "transcribe"})
+                    text = r["text"].strip() if r and "text" in r else ""
+                    conn.execute("UPDATE chunks SET whisper_text=? WHERE id=?", (text, c["id"]))
+                except:
+                    conn.execute("UPDATE chunks SET whisper_text='' WHERE id=?", (c["id"],))
+                    errs += 1
+                done += 1
 
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_chunk, c) for c in chunks]
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except:
-                pass
+        conn.commit()
+        el = time.time()-t0
+        r = done/el if el > 0 else 0
+        eta = (len(chunks)-done)/r if r > 0 else 0
+        if done % 200 == 0 or done >= len(chunks):
+            print(f"  [WHISPER {done}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs}")
 
     conn.commit()
     conn.close()
     el = time.time()-t0
     print(f"[WHISPER] Done in {el/60:.1f}m. {len(chunks)} chunks, {errs} errors")
-    del model
+    del pipe
     gc.collect()
     torch.cuda.empty_cache()
 
