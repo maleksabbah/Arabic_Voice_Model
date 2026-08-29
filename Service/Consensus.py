@@ -9,7 +9,7 @@ Usage:
   python Service/Consensus.py --db /workspace/asr.db --series 1 2 3 --phase conformer
   python Service/Consensus.py --db /workspace/asr.db --series 1 2 3 --phase consensus
 """
-import argparse, gc, os, re, time, sqlite3, torch, Levenshtein
+import argparse, gc, os, re, time, sqlite3, torch, Levenshtein, threading
 
 DIACRITICS = set("\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0670\u0655")
 
@@ -45,40 +45,43 @@ def get_chunks(db_path, series_ids, phase="all"):
     conn.close()
     return [{"id":r[0],"file_path":r[1],"filename":r[2],"series_id":r[3]} for r in rows]
 
-def run_whisper(chunks, db_path):
-    from faster_whisper import WhisperModel, BatchedInferencePipeline
+def run_whisper(chunks, db_path, file_batch=32):
+    from faster_whisper import WhisperModel
     print(f"[WHISPER] Loading large-v3-turbo...")
     model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
-    pipeline = BatchedInferencePipeline(model=model)
-    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks with batched inference...")
+    print(f"[WHISPER] Loaded. Processing {len(chunks)} chunks, file_batch={file_batch}")
 
     conn = sqlite3.connect(db_path)
     t0 = time.time()
     errs = 0
-    saved = 0
+    done = 0
 
-    for i, c in enumerate(chunks):
-        try:
-            segments, _ = pipeline.transcribe(c["file_path"], language="ar", beam_size=5, batch_size=16)
-            text = " ".join([s.text for s in segments]).strip()
-            conn.execute("UPDATE chunks SET whisper_text=? WHERE id=?", (text, c["id"]))
-        except Exception as e:
-            conn.execute("UPDATE chunks SET whisper_text='' WHERE id=?", (c["id"],))
-            errs += 1
+    for batch_start in range(0, len(chunks), file_batch):
+        batch_end = min(batch_start + file_batch, len(chunks))
+        batch = chunks[batch_start:batch_end]
 
-        if (i+1) % 200 == 0:
-            conn.commit()
-            saved = i+1
+        for c in batch:
+            try:
+                segs, _ = model.transcribe(c["file_path"], language="ar", beam_size=5, vad_filter=True)
+                text = " ".join([s.text for s in segs]).strip()
+                conn.execute("UPDATE chunks SET whisper_text=? WHERE id=?", (text, c["id"]))
+            except:
+                conn.execute("UPDATE chunks SET whisper_text='' WHERE id=?", (c["id"],))
+                errs += 1
+            done += 1
+
+        conn.commit()
+        if done % 200 == 0 or done == len(chunks):
             el = time.time()-t0
-            r = (i+1)/el
-            eta = (len(chunks)-i-1)/r
-            print(f"  [WHISPER {i+1}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs} saved={saved}")
+            r = done/el if el > 0 else 0
+            eta = (len(chunks)-done)/r if r > 0 else 0
+            print(f"  [WHISPER {done}/{len(chunks)}] {r:.1f}/s ETA {eta/60:.0f}m err={errs}")
 
     conn.commit()
     conn.close()
     el = time.time()-t0
     print(f"[WHISPER] Done in {el/60:.1f}m. {len(chunks)} chunks, {errs} errors")
-    del model, pipeline
+    del model
     gc.collect()
     torch.cuda.empty_cache()
 
