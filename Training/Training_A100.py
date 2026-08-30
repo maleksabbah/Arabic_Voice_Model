@@ -183,6 +183,10 @@ def train(args):
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
+
     # Datasets
     train_dataset = ChunkDataset(train_chunks, processor)
     val_dataset = ChunkDataset(val_chunks, processor)
