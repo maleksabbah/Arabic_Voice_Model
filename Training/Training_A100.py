@@ -173,11 +173,6 @@ def train(args):
     model.print_trainable_parameters()
     model.to("cuda")
 
-    # Forced decoder ids for Arabic
-    model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(
-        language="ar", task="transcribe"
-    )
-    model.config.suppress_tokens = []
 
     # Dataset and dataloader
     train_dataset = ChunkDataset(train_chunks, processor)
