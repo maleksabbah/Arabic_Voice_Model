@@ -1,38 +1,38 @@
 """
-LoRA training for Whisper Large V3 using Seq2SeqTrainer.
-Uses HuggingFace Trainer which handles peft/Whisper compatibility correctly.
+Manual LoRA training for Whisper Large V3 with MGB-3, FLEURS, Casablanca benchmarks.
+Standalone script for RunPod — no project imports.
 
 Usage:
   python Training/Training_A100.py --db /workspace/asr.db --series 1 2 3 --epochs 3
 """
 import argparse
 import os
+import time
 import sqlite3
 import random
+import gc
 import numpy as np
-import torch
-import soundfile as sf
-from dataclasses import dataclass
-from typing import Any, Dict, List, Union
 
-from transformers import (
-    WhisperProcessor,
-    WhisperForConditionalGeneration,
-    Seq2SeqTrainingArguments,
-    Seq2SeqTrainer,
-)
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import soundfile as sf
+from jiwer import wer as compute_wer
+
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from peft import LoraConfig, get_peft_model
-from torch.utils.data import Dataset
-import evaluate
+from datasets import load_dataset
 
 
 # ============================================================
 # DATASET
 # ============================================================
 class ChunkDataset(Dataset):
-    def __init__(self, chunks, processor):
+    def __init__(self, chunks, processor, max_duration=30):
         self.chunks = chunks
         self.processor = processor
+        self.max_duration = max_duration
 
     def __len__(self):
         return len(self.chunks)
@@ -47,67 +47,34 @@ class ChunkDataset(Dataset):
                 import librosa
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
                 sr = 16000
-            max_samples = int(30 * sr)
+            max_samples = int(self.max_duration * sr)
             audio = audio[:max_samples]
         except:
             audio = np.zeros(16000, dtype=np.float32)
 
         input_features = self.processor(
             audio, sampling_rate=16000, return_tensors="pt"
-        ).input_features[0]
+        ).input_features.squeeze(0)
 
         labels = self.processor.tokenizer(
             c["transcription"],
             return_tensors="pt",
+            padding=False,
             truncation=True,
             max_length=448,
-        ).input_ids[0]
+        ).input_ids.squeeze(0)
 
         return {"input_features": input_features, "labels": labels}
 
 
-# ============================================================
-# DATA COLLATOR
-# ============================================================
-@dataclass
-class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: Any
-    decoder_start_token_id: int
-
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": f["input_features"]} for f in features]
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-
-        label_features = [{"input_ids": f["labels"]} for f in features]
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
-        labels = labels_batch["input_ids"].masked_fill(
-            labels_batch.attention_mask.ne(1), -100
-        )
-
-        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
-            labels = labels[:, 1:]
-
-        batch["labels"] = labels
-        return batch
-
-
-# ============================================================
-# METRICS
-# ============================================================
-def make_compute_metrics(processor):
-    metric = evaluate.load("wer")
-
-    def compute_metrics(pred):
-        pred_ids = pred.predictions
-        label_ids = pred.label_ids
-        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-        pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-        wer_val = metric.compute(predictions=pred_str, references=label_str)
-        return {"wer": wer_val}
-
-    return compute_metrics
+def collate_fn(batch):
+    input_features = torch.stack([b["input_features"] for b in batch])
+    label_lengths = [len(b["labels"]) for b in batch]
+    max_len = max(label_lengths)
+    labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
+    for i, b in enumerate(batch):
+        labels[i, :len(b["labels"])] = b["labels"]
+    return {"input_features": input_features, "labels": labels}
 
 
 # ============================================================
@@ -129,11 +96,115 @@ def get_labeled_chunks(db_path, series_ids):
 
 
 # ============================================================
-# MAIN
+# BENCHMARKS
+# ============================================================
+def run_inference(model, processor, audio, device):
+    """Run inference on a single audio array."""
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt").input_features.to(device, dtype=torch.float16)
+    with torch.no_grad():
+        predicted_ids = model.generate(
+            inputs,
+            language="ar",
+            task="transcribe",
+            max_new_tokens=448,
+        )
+    return processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+
+
+def benchmark_fleurs(model, processor, device, max_samples=200):
+    """Benchmark on FLEURS Arabic (MSA)."""
+    print("  [BENCH] FLEURS (MSA)...", end=" ", flush=True)
+    model.eval()
+    try:
+        ds = load_dataset("google/fleurs", "ar_eg", split="test", streaming=True, trust_remote_code=True)
+        refs, hyps = [], []
+        for i, sample in enumerate(ds):
+            if i >= max_samples:
+                break
+            audio = np.array(sample["audio"]["array"], dtype=np.float32)
+            ref = sample["transcription"]
+            hyp = run_inference(model, processor, audio, device)
+            refs.append(ref)
+            hyps.append(hyp)
+        w = compute_wer(refs, hyps) if refs else 1.0
+        print(f"{w:.2%} ({len(refs)} samples)")
+        return w
+    except Exception as e:
+        print(f"FAILED: {e}")
+        return None
+
+
+def benchmark_mgb3(model, processor, device, max_samples=200):
+    """Benchmark on MGB-3 (Egyptian dialect)."""
+    print("  [BENCH] MGB-3 (Egyptian)...", end=" ", flush=True)
+    model.eval()
+    try:
+        ds = load_dataset("arabic-speech-community/mgb3", split="test", streaming=True, trust_remote_code=True)
+        refs, hyps = [], []
+        for i, sample in enumerate(ds):
+            if i >= max_samples:
+                break
+            audio = np.array(sample["audio"]["array"], dtype=np.float32)
+            sr = sample["audio"]["sampling_rate"]
+            if sr != 16000:
+                import librosa
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+            ref = sample["text"]
+            hyp = run_inference(model, processor, audio, device)
+            refs.append(ref)
+            hyps.append(hyp)
+        w = compute_wer(refs, hyps) if refs else 1.0
+        print(f"{w:.2%} ({len(refs)} samples)")
+        return w
+    except Exception as e:
+        print(f"FAILED: {e}")
+        return None
+
+
+def benchmark_casablanca(model, processor, device, max_samples=200):
+    """Benchmark on Casablanca (multi-dialect Arabic)."""
+    print("  [BENCH] Casablanca (multi-dialect)...", end=" ", flush=True)
+    model.eval()
+    try:
+        ds = load_dataset("Zaid/casablanca_test", split="test", streaming=True, trust_remote_code=True)
+        refs, hyps = [], []
+        for i, sample in enumerate(ds):
+            if i >= max_samples:
+                break
+            audio = np.array(sample["audio"]["array"], dtype=np.float32)
+            sr = sample["audio"]["sampling_rate"]
+            if sr != 16000:
+                import librosa
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+            ref = sample["sentence"]
+            hyp = run_inference(model, processor, audio, device)
+            refs.append(ref)
+            hyps.append(hyp)
+        w = compute_wer(refs, hyps) if refs else 1.0
+        print(f"{w:.2%} ({len(refs)} samples)")
+        return w
+    except Exception as e:
+        print(f"FAILED: {e}")
+        return None
+
+
+def run_all_benchmarks(model, processor, device, max_samples=200):
+    """Run all benchmarks and return results dict."""
+    results = {}
+    results["fleurs"] = benchmark_fleurs(model, processor, device, max_samples)
+    results["mgb3"] = benchmark_mgb3(model, processor, device, max_samples)
+    results["casablanca"] = benchmark_casablanca(model, processor, device, max_samples)
+    return results
+
+
+# ============================================================
+# TRAINING
 # ============================================================
 def train(args):
+    device = "cuda"
+
     print("=" * 60)
-    print("LORA TRAINING — WHISPER LARGE V3 (Seq2SeqTrainer)")
+    print("MANUAL LORA TRAINING — WHISPER LARGE V3")
     print("=" * 60)
     print(f"DB: {args.db}")
     print(f"Series: {args.series}")
@@ -141,13 +212,13 @@ def train(args):
     print(f"Rank: {args.rank}, Alpha: {args.alpha}")
     print(f"LR: {args.lr}")
     print(f"Batch: {args.batch_size} x {args.accumulation}")
+    print(f"Benchmark samples: {args.benchmark_samples}")
     print()
 
     # Load data
     print("[DATA] Loading...")
     chunks = get_labeled_chunks(args.db, args.series)
     print(f"[DATA] {len(chunks)} labeled chunks")
-
     if not chunks:
         print("No data!")
         return
@@ -167,11 +238,6 @@ def train(args):
         torch_dtype=torch.float16,
     )
 
-    # Set language and task
-    model.generation_config.language = "ar"
-    model.generation_config.task = "transcribe"
-    model.generation_config.forced_decoder_ids = None
-
     # Apply LoRA
     print(f"[MODEL] LoRA rank={args.rank}, alpha={args.alpha}")
     lora_config = LoraConfig(
@@ -179,74 +245,147 @@ def train(args):
         lora_alpha=args.alpha,
         lora_dropout=args.dropout,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        task_type="SEQ_2_SEQ_LM",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    # Enable input grads for peft compatibility
+    model.enable_input_require_grads()
+
+    # Cast trainable params to float32
     for param in model.parameters():
         if param.requires_grad:
             param.data = param.data.float()
 
-    # Datasets
+    model.to(device)
+
+    # Dataloader
     train_dataset = ChunkDataset(train_chunks, processor)
-    val_dataset = ChunkDataset(val_chunks, processor)
-
-    # Collator
-    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-        processor=processor,
-        decoder_start_token_id=model.config.decoder_start_token_id,
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        drop_last=True,
     )
 
-    # Training args
-    training_args = Seq2SeqTrainingArguments(
-        output_dir="/workspace/checkpoints",
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.accumulation,
-        learning_rate=args.lr,
-        warmup_ratio=0.1,
-        num_train_epochs=args.epochs,
-        fp16=True,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        logging_steps=50,
-        predict_with_generate=True,
-        generation_max_length=448,
-        load_best_model_at_end=True,
-        metric_for_best_model="wer",
-        greater_is_better=False,
-        save_total_limit=3,
-        report_to="none",
-        remove_unused_columns=False,
-        label_names=["labels"],
-        dataloader_num_workers=4,
-        gradient_checkpointing=True,
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        weight_decay=0.01,
     )
 
-    # Trainer
-    trainer = Seq2SeqTrainer(
-        args=training_args,
-        model=model,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        compute_metrics=make_compute_metrics(processor),
-        tokenizer=processor.feature_extractor,
+    # Scheduler
+    total_steps = len(train_loader) * args.epochs // args.accumulation
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=total_steps,
+        pct_start=0.1,
     )
 
-    print(f"\n[TRAIN] Starting...")
-    trainer.train()
+    scaler = GradScaler()
 
-    # Save best
-    print("[SAVE] Saving best model...")
-    model.save_pretrained("/workspace/checkpoints/lora_best")
-    processor.save_pretrained("/workspace/checkpoints/lora_best")
+    # Run baseline benchmarks before training
+    print("\n[BASELINE] Running benchmarks before training...")
+    baseline = run_all_benchmarks(model, processor, device, args.benchmark_samples)
+    print()
 
-    # Final eval
-    metrics = trainer.evaluate()
+    # Training loop
+    best_val_wer = 1.0
+    print(f"[TRAIN] {total_steps} total steps, {len(train_loader)} steps/epoch")
+
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0
+        t0 = time.time()
+
+        for step, batch in enumerate(train_loader):
+            input_features = batch["input_features"].to(device, dtype=torch.float16)
+            labels = batch["labels"].to(device)
+
+            with autocast():
+                outputs = model(input_features=input_features, labels=labels)
+                loss = outputs.loss / args.accumulation
+
+            scaler.scale(loss).backward()
+
+            if (step + 1) % args.accumulation == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+
+            epoch_loss += loss.item() * args.accumulation
+
+            if (step + 1) % 100 == 0:
+                avg = epoch_loss / (step + 1)
+                el = time.time() - t0
+                rate = (step + 1) / el
+                eta = (len(train_loader) - step - 1) / rate
+                lr = scheduler.get_last_lr()[0]
+                print(f"  [E{epoch+1} {step+1}/{len(train_loader)}] loss={avg:.4f} lr={lr:.2e} {rate:.1f}s/s ETA {eta/60:.0f}m")
+
+        avg_loss = epoch_loss / len(train_loader)
+        elapsed = time.time() - t0
+
+        # Val WER on subset
+        print(f"  [E{epoch+1}] Evaluating val set...")
+        model.eval()
+        val_refs, val_hyps = [], []
+        val_sample = random.sample(val_chunks, min(200, len(val_chunks)))
+        for c in val_sample:
+            try:
+                audio, sr = sf.read(c["file_path"], dtype="float32")
+                if len(audio.shape) > 1:
+                    audio = audio.mean(axis=1)
+                if sr != 16000:
+                    import librosa
+                    audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+                hyp = run_inference(model, processor, audio, device)
+                val_refs.append(c["transcription"])
+                val_hyps.append(hyp)
+            except:
+                pass
+        val_wer = compute_wer(val_refs, val_hyps) if val_refs else 1.0
+
+        print(f"  [E{epoch+1}] Loss={avg_loss:.4f} Val_WER={val_wer:.2%} Time={elapsed/60:.1f}m")
+
+        # Run benchmarks
+        print(f"  [E{epoch+1}] Running benchmarks...")
+        bench = run_all_benchmarks(model, processor, device, args.benchmark_samples)
+
+        # Save checkpoint
+        ckpt_dir = f"/workspace/checkpoints/lora_epoch_{epoch+1}"
+        os.makedirs(ckpt_dir, exist_ok=True)
+        model.save_pretrained(ckpt_dir)
+        processor.save_pretrained(ckpt_dir)
+        print(f"  [E{epoch+1}] Saved to {ckpt_dir}")
+
+        if val_wer < best_val_wer:
+            best_val_wer = val_wer
+            best_dir = "/workspace/checkpoints/lora_best"
+            os.makedirs(best_dir, exist_ok=True)
+            model.save_pretrained(best_dir)
+            processor.save_pretrained(best_dir)
+            print(f"  [E{epoch+1}] New best! WER={val_wer:.2%}")
+
+        model.train()
+
+    # Final summary
     print(f"\n{'='*60}")
     print(f"TRAINING COMPLETE")
     print(f"{'='*60}")
-    print(f"Final WER: {metrics.get('eval_wer', 'N/A')}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Best Val WER: {best_val_wer:.2%}")
+    print(f"Baseline: FLEURS={baseline.get('fleurs','N/A')} MGB3={baseline.get('mgb3','N/A')} Casa={baseline.get('casablanca','N/A')}")
+    print(f"Final:   FLEURS={bench.get('fleurs','N/A')} MGB3={bench.get('mgb3','N/A')} Casa={bench.get('casablanca','N/A')}")
     print(f"Checkpoints: /workspace/checkpoints/")
     print(f"{'='*60}")
 
@@ -262,6 +401,7 @@ def main():
     p.add_argument("--rank", type=int, default=64)
     p.add_argument("--alpha", type=int, default=128)
     p.add_argument("--dropout", type=float, default=0.05)
+    p.add_argument("--benchmark-samples", type=int, default=200)
     a = p.parse_args()
     train(a)
 
