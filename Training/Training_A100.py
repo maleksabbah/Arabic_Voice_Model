@@ -16,7 +16,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 import soundfile as sf
 from jiwer import wer as compute_wer
 
@@ -96,13 +95,23 @@ def get_labeled_chunks(db_path, series_ids):
 
 
 # ============================================================
-# BENCHMARKS
+# BENCHMARKS — uses soundfile for audio, no torchcodec needed
 # ============================================================
+def load_audio_from_sample(sample):
+    """Extract audio array from a HuggingFace dataset sample."""
+    audio = np.array(sample["audio"]["array"], dtype=np.float32)
+    sr = sample["audio"]["sampling_rate"]
+    if sr != 16000:
+        import librosa
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+    return audio
+
+
 def run_inference(model, processor, audio, device):
-    """Run inference on a single audio array."""
+    """Run inference on a single audio array. Bypasses peft wrapper."""
     inputs = processor(audio, sampling_rate=16000, return_tensors="pt").input_features.to(device, dtype=torch.float16)
     with torch.no_grad():
-        predicted_ids = model.generate(
+        predicted_ids = model.base_model.model.generate(
             inputs,
             language="ar",
             task="transcribe",
@@ -116,12 +125,12 @@ def benchmark_fleurs(model, processor, device, max_samples=200):
     print("  [BENCH] FLEURS (MSA)...", end=" ", flush=True)
     model.eval()
     try:
-        ds = load_dataset("google/fleurs", "ar_eg", split="test", streaming=True, trust_remote_code=True)
+        ds = load_dataset("google/fleurs", "ar_eg", split="test", streaming=True)
         refs, hyps = [], []
         for i, sample in enumerate(ds):
             if i >= max_samples:
                 break
-            audio = np.array(sample["audio"]["array"], dtype=np.float32)
+            audio = load_audio_from_sample(sample)
             ref = sample["transcription"]
             hyp = run_inference(model, processor, audio, device)
             refs.append(ref)
@@ -139,17 +148,13 @@ def benchmark_mgb3(model, processor, device, max_samples=200):
     print("  [BENCH] MGB-3 (Egyptian)...", end=" ", flush=True)
     model.eval()
     try:
-        ds = load_dataset("arabic-speech-community/mgb3", split="test", streaming=True, trust_remote_code=True)
+        ds = load_dataset("MightyStudent/Egyptian-ASR-MGB-3", split="train", streaming=True)
         refs, hyps = [], []
         for i, sample in enumerate(ds):
             if i >= max_samples:
                 break
-            audio = np.array(sample["audio"]["array"], dtype=np.float32)
-            sr = sample["audio"]["sampling_rate"]
-            if sr != 16000:
-                import librosa
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-            ref = sample["text"]
+            audio = load_audio_from_sample(sample)
+            ref = sample["sentence"]
             hyp = run_inference(model, processor, audio, device)
             refs.append(ref)
             hyps.append(hyp)
@@ -166,17 +171,13 @@ def benchmark_casablanca(model, processor, device, max_samples=200):
     print("  [BENCH] Casablanca (multi-dialect)...", end=" ", flush=True)
     model.eval()
     try:
-        ds = load_dataset("Zaid/casablanca_test", split="test", streaming=True, trust_remote_code=True)
+        ds = load_dataset("UBC-NLP/Casablanca", "Egypt", split="test", streaming=True)
         refs, hyps = [], []
         for i, sample in enumerate(ds):
             if i >= max_samples:
                 break
-            audio = np.array(sample["audio"]["array"], dtype=np.float32)
-            sr = sample["audio"]["sampling_rate"]
-            if sr != 16000:
-                import librosa
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-            ref = sample["sentence"]
+            audio = load_audio_from_sample(sample)
+            ref = sample["transcription"]
             hyp = run_inference(model, processor, audio, device)
             refs.append(ref)
             hyps.append(hyp)
@@ -288,7 +289,7 @@ def train(args):
         pct_start=0.1,
     )
 
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     # Run baseline benchmarks before training
     print("\n[BASELINE] Running benchmarks before training...")
@@ -308,8 +309,9 @@ def train(args):
             input_features = batch["input_features"].to(device, dtype=torch.float16)
             labels = batch["labels"].to(device)
 
-            with autocast():
-                outputs = model(input_features=input_features, labels=labels)
+            with torch.amp.autocast('cuda'):
+                # Bypass peft wrapper — call base model directly
+                outputs = model.base_model.model(input_features=input_features, labels=labels)
                 loss = outputs.loss / args.accumulation
 
             scaler.scale(loss).backward()
@@ -385,7 +387,8 @@ def train(args):
     print(f"Epochs: {args.epochs}")
     print(f"Best Val WER: {best_val_wer:.2%}")
     print(f"Baseline: FLEURS={baseline.get('fleurs','N/A')} MGB3={baseline.get('mgb3','N/A')} Casa={baseline.get('casablanca','N/A')}")
-    print(f"Final:   FLEURS={bench.get('fleurs','N/A')} MGB3={bench.get('mgb3','N/A')} Casa={bench.get('casablanca','N/A')}")
+    if bench:
+        print(f"Final:   FLEURS={bench.get('fleurs','N/A')} MGB3={bench.get('mgb3','N/A')} Casa={bench.get('casablanca','N/A')}")
     print(f"Checkpoints: /workspace/checkpoints/")
     print(f"{'='*60}")
 
