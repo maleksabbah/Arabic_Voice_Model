@@ -49,8 +49,13 @@ def normalize_arabic(text):
     return text
 
 
-def transcribe_whisper_sequential(model_name, chunks, label="model"):
-    """Transcribe chunks sequentially with Whisper pipeline. For 4GB GPU."""
+def transcribe_whisper_sequential(model_name, chunks, label="model",
+                                  conn=None, column=None, save_every=500):
+    """Transcribe chunks sequentially with Whisper pipeline. For 4GB GPU.
+
+    If conn and column are given, results are committed inline every
+    `save_every` chunks so a pod crash doesn't lose the whole run.
+    """
     from transformers import pipeline as hf_pipeline
 
     print(f"\n{'='*60}")
@@ -67,6 +72,16 @@ def transcribe_whisper_sequential(model_name, chunks, label="model"):
     results = {}
     start = time.time()
     errors = 0
+    pending = []
+
+    def flush(final=False):
+        if not pending or conn is None or not column:
+            pending.clear()
+            return
+        conn.executemany(f"UPDATE chunks SET {column}=? WHERE id=?", pending)
+        conn.commit()
+        print(f"  [SAVE] {len(pending)} {label} results committed" + (" (final)" if final else ""))
+        pending.clear()
 
     for i, chunk in enumerate(chunks):
         cid, file_path, episode_id, filename = chunk["id"], chunk["file_path"], chunk["episode_id"], chunk["filename"]
@@ -85,12 +100,18 @@ def transcribe_whisper_sequential(model_name, chunks, label="model"):
                 results[cid] = ""
                 errors += 1
 
+        pending.append((results[cid], cid))
+        if len(pending) >= save_every:
+            flush()
+
         if i < 3 or (i + 1) % 100 == 0 or i == len(chunks) - 1:
             elapsed = time.time() - start
             rate = (i + 1) / elapsed if elapsed > 0 else 0
             eta = (len(chunks) - i - 1) / rate if rate > 0 else 0
             text_preview = results.get(cid, "")[:50]
             print(f"  [{i+1}/{len(chunks)}] ({rate:.1f} chunks/s, ETA {eta/60:.0f}m) ep{episode_id} {filename}: {text_preview}")
+
+    flush(final=True)
 
     elapsed = time.time() - start
     print(f"Completed {len(chunks)} chunks in {elapsed/60:.1f}m ({errors} errors)")
@@ -316,20 +337,8 @@ def main():
             print(f"\n[WHISPER] {len(need_whisper)} chunks need transcription")
             w_results = transcribe_whisper_sequential(
                 "openai/whisper-large-v3-turbo", need_whisper, "whisper-turbo",
+                conn=conn, column="whisper_text", save_every=args.save_every,
             )
-            # Save to DB in batches
-            batch = []
-            for cid, text in w_results.items():
-                batch.append((text, cid))
-                if len(batch) >= args.save_every:
-                    conn.executemany("UPDATE chunks SET whisper_text=? WHERE id=?", batch)
-                    conn.commit()
-                    print(f"  [SAVE] {len(batch)} whisper results committed")
-                    batch = []
-            if batch:
-                conn.executemany("UPDATE chunks SET whisper_text=? WHERE id=?", batch)
-                conn.commit()
-                print(f"  [SAVE] {len(batch)} whisper results committed (final)")
         else:
             print(f"\n[WHISPER] All {len(all_chunks)} chunks already done, skipping")
 
@@ -340,19 +349,8 @@ def main():
             print(f"\n[CODESWITCHING] {len(need_cs)} chunks need transcription")
             cs_results = transcribe_whisper_sequential(
                 "MohamedRashad/Arabic-Whisper-CodeSwitching-Edition", need_cs, "codeswitching",
+                conn=conn, column="codeswitching_text", save_every=args.save_every,
             )
-            batch = []
-            for cid, text in cs_results.items():
-                batch.append((text, cid))
-                if len(batch) >= args.save_every:
-                    conn.executemany("UPDATE chunks SET codeswitching_text=? WHERE id=?", batch)
-                    conn.commit()
-                    print(f"  [SAVE] {len(batch)} codeswitching results committed")
-                    batch = []
-            if batch:
-                conn.executemany("UPDATE chunks SET codeswitching_text=? WHERE id=?", batch)
-                conn.commit()
-                print(f"  [SAVE] {len(batch)} codeswitching results committed (final)")
         else:
             print(f"\n[CODESWITCHING] All {len(all_chunks)} chunks already done, skipping")
 
