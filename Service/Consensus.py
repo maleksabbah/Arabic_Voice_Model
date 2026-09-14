@@ -28,10 +28,13 @@ Usage:
 """
 import argparse
 import gc
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 import torch
 import re
+import numpy as np
 import Levenshtein
 
 import sqlite3
@@ -49,9 +52,45 @@ def normalize_arabic(text):
     return text
 
 
+def _decode_opus(path, sr=16000):
+    """Decode one audio file to float32 mono via ffmpeg. Returns None on failure."""
+    try:
+        raw = subprocess.run(
+            ["ffmpeg", "-nostdin", "-threads", "1", "-i", path,
+             "-f", "f32le", "-ac", "1", "-ar", str(sr), "-v", "quiet", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True,
+        ).stdout
+        return np.frombuffer(raw, dtype=np.float32).copy()
+    except Exception:
+        return None
+
+
+def _prefetch_audio(chunks, workers=32, lookahead=256, sr=16000):
+    """Yield decoded audio dicts in order, decoding `workers`-wide ahead of the GPU."""
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        pending = []
+        it = iter(chunks)
+        for c in it:
+            pending.append(pool.submit(_decode_opus, c["file_path"], sr))
+            if len(pending) >= lookahead:
+                break
+        for c in it:
+            audio = pending.pop(0).result()
+            pending.append(pool.submit(_decode_opus, c["file_path"], sr))
+            yield {"raw": audio if audio is not None else np.zeros(sr, dtype=np.float32),
+                   "sampling_rate": sr}
+        for f in pending:
+            audio = f.result()
+            yield {"raw": audio if audio is not None else np.zeros(sr, dtype=np.float32),
+                   "sampling_rate": sr}
+    finally:
+        pool.shutdown(wait=False)
+
+
 def transcribe_whisper_sequential(model_name, chunks, label="model",
                                   conn=None, column=None, save_every=500,
-                                  batch_size=64, num_workers=8):
+                                  batch_size=64, num_workers=32):
     """Batched Whisper transcription, tuned for throughput on a large GPU.
 
     Audio decode runs in `num_workers` dataloader processes while the GPU runs
@@ -93,14 +132,11 @@ def transcribe_whisper_sequential(model_name, chunks, label="model",
         print(f"  [SAVE] {len(pending)} {label} results committed" + (" (final)" if final else ""), flush=True)
         pending.clear()
 
-    def paths():
-        for c in chunks:
-            yield c["file_path"]
-
     gen_kwargs = {"language": "ar", "task": "transcribe"}
 
     try:
-        stream = pipe(paths(), generate_kwargs=gen_kwargs, num_workers=num_workers)
+        stream = pipe(_prefetch_audio(chunks, workers=num_workers),
+                      generate_kwargs=gen_kwargs)
         for i, out in enumerate(stream):
             chunk = chunks[i]
             cid = chunk["id"]
@@ -290,7 +326,7 @@ def main():
                         help="Run a specific phase only")
     parser.add_argument("--save-every", type=int, default=500, help="Save to DB every N chunks per model")
     parser.add_argument("--whisper-batch-size", type=int, default=64, help="Whisper/CodeSwitching batch size")
-    parser.add_argument("--num-workers", type=int, default=8, help="Audio decode worker processes")
+    parser.add_argument("--num-workers", type=int, default=32, help="Parallel ffmpeg decode threads")
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
