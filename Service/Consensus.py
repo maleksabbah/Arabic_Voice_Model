@@ -50,23 +50,33 @@ def normalize_arabic(text):
 
 
 def transcribe_whisper_sequential(model_name, chunks, label="model",
-                                  conn=None, column=None, save_every=500):
-    """Transcribe chunks sequentially with Whisper pipeline. For 4GB GPU.
+                                  conn=None, column=None, save_every=500,
+                                  batch_size=64, num_workers=8):
+    """Batched Whisper transcription, tuned for throughput on a large GPU.
 
-    If conn and column are given, results are committed inline every
-    `save_every` chunks so a pod crash doesn't lose the whole run.
+    Audio decode runs in `num_workers` dataloader processes while the GPU runs
+    a batch of `batch_size`, so opus decoding never stalls inference. Results
+    stream back in input order and commit every `save_every` chunks.
     """
     from transformers import pipeline as hf_pipeline
 
-    print(f"\n{'='*60}")
+    print("")
+    print("=" * 60)
     print(f"Loading: {model_name} [{label}] ({len(chunks)} chunks)")
-    print(f"{'='*60}")
+    print(f"batch_size={batch_size} num_workers={num_workers}")
+    print(f"{'='*60}", flush=True)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     pipe = hf_pipeline(
         "automatic-speech-recognition",
         model=model_name,
         device="cuda",
         torch_dtype=torch.float16,
+        batch_size=batch_size,
+        model_kwargs={"attn_implementation": "sdpa"},
     )
 
     results = {}
@@ -80,41 +90,59 @@ def transcribe_whisper_sequential(model_name, chunks, label="model",
             return
         conn.executemany(f"UPDATE chunks SET {column}=? WHERE id=?", pending)
         conn.commit()
-        print(f"  [SAVE] {len(pending)} {label} results committed" + (" (final)" if final else ""))
+        print(f"  [SAVE] {len(pending)} {label} results committed" + (" (final)" if final else ""), flush=True)
         pending.clear()
 
-    for i, chunk in enumerate(chunks):
-        cid, file_path, episode_id, filename = chunk["id"], chunk["file_path"], chunk["episode_id"], chunk["filename"]
-        try:
-            out = pipe(file_path, generate_kwargs={"language": "ar", "task": "transcribe"})
-            results[cid] = out["text"]
-        except Exception as e:
-            if "3000 mel" in str(e):
-                try:
-                    out = pipe(file_path, generate_kwargs={"language": "ar", "task": "transcribe"}, return_timestamps=True)
-                    results[cid] = out["text"]
-                except Exception as e2:
-                    results[cid] = ""
-                    errors += 1
-            else:
+    def paths():
+        for c in chunks:
+            yield c["file_path"]
+
+    gen_kwargs = {"language": "ar", "task": "transcribe"}
+
+    try:
+        stream = pipe(paths(), generate_kwargs=gen_kwargs, num_workers=num_workers)
+        for i, out in enumerate(stream):
+            chunk = chunks[i]
+            cid = chunk["id"]
+            text = (out or {}).get("text", "") or ""
+            if not text:
+                errors += 1
+            results[cid] = text
+            pending.append((text, cid))
+            if len(pending) >= save_every:
+                flush()
+
+            if i < 3 or (i + 1) % 100 == 0 or i == len(chunks) - 1:
+                elapsed = time.time() - start
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (len(chunks) - i - 1) / rate if rate > 0 else 0
+                print(f"  [{i+1}/{len(chunks)}] ({rate:.1f} chunks/s, ETA {eta/60:.0f}m) "
+                      f"ep{chunk['episode_id']} {chunk['filename']}: {text[:50]}", flush=True)
+    except Exception as e:
+        print(f"  Batched pass failed ({e}); falling back to per-file", flush=True)
+        done = set(results)
+        for i, chunk in enumerate(chunks):
+            cid = chunk["id"]
+            if cid in done:
+                continue
+            try:
+                out = pipe(chunk["file_path"], generate_kwargs=gen_kwargs)
+                results[cid] = out["text"]
+            except Exception:
                 results[cid] = ""
                 errors += 1
-
-        pending.append((results[cid], cid))
-        if len(pending) >= save_every:
-            flush()
-
-        if i < 3 or (i + 1) % 100 == 0 or i == len(chunks) - 1:
-            elapsed = time.time() - start
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (len(chunks) - i - 1) / rate if rate > 0 else 0
-            text_preview = results.get(cid, "")[:50]
-            print(f"  [{i+1}/{len(chunks)}] ({rate:.1f} chunks/s, ETA {eta/60:.0f}m) ep{episode_id} {filename}: {text_preview}")
+            pending.append((results[cid], cid))
+            if len(pending) >= save_every:
+                flush()
+            if (i + 1) % 100 == 0:
+                print(f"  [{i+1}/{len(chunks)}] (fallback) {results[cid][:50]}", flush=True)
 
     flush(final=True)
 
     elapsed = time.time() - start
-    print(f"Completed {len(chunks)} chunks in {elapsed/60:.1f}m ({errors} errors)")
+    rate = len(chunks) / elapsed if elapsed > 0 else 0
+    print(f"Completed {len(chunks)} chunks in {elapsed/60:.1f}m "
+          f"({rate:.1f} chunks/s, {errors} empty)", flush=True)
 
     del pipe
     gc.collect()
@@ -261,6 +289,8 @@ def main():
                         choices=["all", "whisper", "codeswitching", "conformer", "consensus"],
                         help="Run a specific phase only")
     parser.add_argument("--save-every", type=int, default=500, help="Save to DB every N chunks per model")
+    parser.add_argument("--whisper-batch-size", type=int, default=64, help="Whisper/CodeSwitching batch size")
+    parser.add_argument("--num-workers", type=int, default=8, help="Audio decode worker processes")
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -338,6 +368,7 @@ def main():
             w_results = transcribe_whisper_sequential(
                 "openai/whisper-large-v3-turbo", need_whisper, "whisper-turbo",
                 conn=conn, column="whisper_text", save_every=args.save_every,
+                batch_size=args.whisper_batch_size, num_workers=args.num_workers,
             )
         else:
             print(f"\n[WHISPER] All {len(all_chunks)} chunks already done, skipping")
@@ -350,6 +381,7 @@ def main():
             cs_results = transcribe_whisper_sequential(
                 "MohamedRashad/Arabic-Whisper-CodeSwitching-Edition", need_cs, "codeswitching",
                 conn=conn, column="codeswitching_text", save_every=args.save_every,
+                batch_size=args.whisper_batch_size, num_workers=args.num_workers,
             )
         else:
             print(f"\n[CODESWITCHING] All {len(all_chunks)} chunks already done, skipping")
