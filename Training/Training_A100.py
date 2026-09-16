@@ -167,6 +167,7 @@ def evaluate(model, processor, samples, device, gen_config):
     return {'wer': mean_wer, 'cer': mean_cer, 'samples': len(wer_scores), 'per_series': series_metrics}
 
 def main():
+    global DB_PATH, CHUNKS_DIR, EPOCHS, LEARNING_RATE, LORA_RANK, LORA_ALPHA
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=str, default=DB_PATH)
     parser.add_argument("--chunks-dir", type=str, default=CHUNKS_DIR)
@@ -178,7 +179,6 @@ def main():
     parser.add_argument("--alpha", type=int, default=LORA_ALPHA)
     args = parser.parse_args()
 
-    global DB_PATH, CHUNKS_DIR, EPOCHS, LEARNING_RATE, LORA_RANK, LORA_ALPHA
     DB_PATH = args.db
     CHUNKS_DIR = args.chunks_dir
     EPOCHS = args.epochs
