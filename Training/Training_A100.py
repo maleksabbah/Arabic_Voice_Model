@@ -23,7 +23,7 @@ SERIES_IDS = None  # Set via --series flag, or loads all series with transcripti
 EPOCHS = 3
 LEARNING_RATE = 1e-4
 GRADIENT_CLIP = 1.0
-ACCUMULATION_STEPS = 4
+ACCUMULATION_STEPS = 1
 BATCH_SIZE = 16
 NUM_WORKERS = 4
 WARMUP_STEPS = 200
@@ -251,10 +251,13 @@ def main():
 
     random.seed(SEED)
     random.shuffle(all_samples)
-    val_size = min(VAL_SAMPLES, int(len(all_samples) * VALIDATION_SPLIT))
+    val_size = int(len(all_samples) * VALIDATION_SPLIT)
     val_samples = all_samples[:val_size]
     train_samples = all_samples[val_size:]
-    print(f"Train: {len(train_samples):,}, Val: {len(val_samples):,}")
+    # Held-out set stays at VALIDATION_SPLIT; only a fixed random subset is scored each epoch
+    # so that per-epoch WER stays comparable and best-checkpoint selection is not sampling noise.
+    val_eval_samples = random.sample(val_samples, min(VAL_SAMPLES, len(val_samples)))
+    print(f"Train: {len(train_samples):,}, Val: {len(val_samples):,} (evaluating {len(val_eval_samples):,} of them)")
 
     train_loader = DataLoader(
         ChunkDataset(train_samples, processor),
@@ -322,7 +325,7 @@ def main():
         print(f"Processed: {processed}, Skipped: {skipped}")
 
         print("\nEvaluating...")
-        val_metrics = evaluate(model, processor, val_samples, device, gen_config)
+        val_metrics = evaluate(model, processor, val_eval_samples, device, gen_config)
 
         if val_metrics['wer'] < best_wer:
             best_wer = val_metrics['wer']
