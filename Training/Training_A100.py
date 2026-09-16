@@ -5,6 +5,7 @@ No torchcodec, no datasets Audio — loads WAV files directly with soundfile.
 import os, re, json, random, sqlite3, argparse
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
 import soundfile as sf
 from pathlib import Path
 from datetime import datetime
@@ -23,9 +24,11 @@ EPOCHS = 3
 LEARNING_RATE = 1e-4
 GRADIENT_CLIP = 1.0
 ACCUMULATION_STEPS = 4
-BATCH_SIZE = 4
+BATCH_SIZE = 16
+NUM_WORKERS = 4
 WARMUP_STEPS = 200
 VALIDATION_SPLIT = 0.15
+VAL_SAMPLES = 500
 SEED = 42
 
 LORA_RANK = 32
@@ -108,19 +111,42 @@ def load_data_from_db(db_path, series_ids, chunks_dir):
         print(f"Skipped: {skipped}")
     return samples
 
-def prepare_sample(sample, processor, device):
-    text = normalize_arabic(sample["text"])
-    if not text or len(text.strip()) < 2:
-        return None
-    try:
-        audio = load_audio(sample["audio_path"])
-    except Exception:
-        return None
-    inputs = processor(audio, sampling_rate=16000, return_tensors="pt").to(device)
-    labels = processor.tokenizer(text, return_tensors="pt").input_ids.to(device)
-    if labels.shape[1] > 448:
-        return None
-    return inputs.input_features, labels
+class ChunkDataset(Dataset):
+    """Same filtering as the old prepare_sample, but CPU-only so it can run in workers."""
+    def __init__(self, samples, processor):
+        self.samples = samples
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        text = normalize_arabic(sample["text"])
+        if not text or len(text.strip()) < 2:
+            return None
+        try:
+            audio = load_audio(sample["audio_path"])
+        except Exception:
+            return None
+        input_features = self.processor(audio, sampling_rate=16000, return_tensors="pt").input_features[0]
+        labels = self.processor.tokenizer(text, return_tensors="pt").input_ids[0]
+        if labels.shape[0] > 448:
+            return None
+        return input_features, labels
+
+
+def collate_batch(batch):
+    n_bad = sum(1 for b in batch if b is None)
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None, None, 0, n_bad
+    input_features = torch.stack([b[0] for b in batch])
+    max_len = max(b[1].shape[0] for b in batch)
+    padded_labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
+    for i, (_, l) in enumerate(batch):
+        padded_labels[i, :l.shape[0]] = l
+    return input_features, padded_labels, len(batch), n_bad
 
 def evaluate(model, processor, samples, device, gen_config):
     model.eval()
@@ -225,10 +251,16 @@ def main():
 
     random.seed(SEED)
     random.shuffle(all_samples)
-    val_size = int(len(all_samples) * VALIDATION_SPLIT)
+    val_size = min(VAL_SAMPLES, int(len(all_samples) * VALIDATION_SPLIT))
     val_samples = all_samples[:val_size]
     train_samples = all_samples[val_size:]
     print(f"Train: {len(train_samples):,}, Val: {len(val_samples):,}")
+
+    train_loader = DataLoader(
+        ChunkDataset(train_samples, processor),
+        batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+        collate_fn=collate_batch, pin_memory=True, persistent_workers=NUM_WORKERS > 0,
+    )
 
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, weight_decay=0.01)
     total_steps = (len(train_samples) * EPOCHS) // (ACCUMULATION_STEPS * BATCH_SIZE)
@@ -248,40 +280,27 @@ def main():
 
     for epoch in range(EPOCHS):
         print(f"\n{'='*80}\nEPOCH {epoch+1}/{EPOCHS}\n{'='*80}")
-        random.seed(SEED + epoch)
-        epoch_indices = list(range(len(train_samples)))
-        random.shuffle(epoch_indices)
+        torch.manual_seed(SEED + epoch)
         epoch_losses, skipped, processed = [], 0, 0
         model.train()
         optimizer.zero_grad()
-        num_batches = (len(epoch_indices) + BATCH_SIZE - 1) // BATCH_SIZE
-        bar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{EPOCHS}", ncols=120)
+        num_batches = len(train_loader)
+        bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", ncols=120, total=num_batches)
 
-        for batch_idx in bar:
-            batch_start = batch_idx * BATCH_SIZE
-            batch_slice = epoch_indices[batch_start:batch_start + BATCH_SIZE]
+        for batch_idx, batch in enumerate(bar):
             try:
-                input_list, label_list = [], []
-                for idx in batch_slice:
-                    prepared = prepare_sample(train_samples[idx], processor, device)
-                    if prepared is None:
-                        skipped += 1
-                        continue
-                    input_list.append(prepared[0])
-                    label_list.append(prepared[1])
-                if not input_list: continue
-                input_features = torch.cat(input_list, dim=0)
-                max_len = max(l.shape[1] for l in label_list)
-                padded_labels = torch.full((len(label_list), max_len), -100, dtype=torch.long, device=device)
-                for i, l in enumerate(label_list):
-                    padded_labels[i, :l.shape[1]] = l[0]
+                input_features, padded_labels, n_ok, n_bad = batch
+                skipped += n_bad
+                if n_ok == 0: continue
+                input_features = input_features.to(device, non_blocking=True)
+                padded_labels = padded_labels.to(device, non_blocking=True)
                 with torch.amp.autocast('cuda'):
                     out = model(input_features=input_features, labels=padded_labels)
                     loss = out.loss / ACCUMULATION_STEPS
                 scaler.scale(loss).backward()
                 loss_val = out.loss.item()
                 epoch_losses.append(loss_val)
-                processed += len(input_list)
+                processed += n_ok
                 if ((batch_idx + 1) % ACCUMULATION_STEPS == 0) or (batch_idx == num_batches - 1):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
