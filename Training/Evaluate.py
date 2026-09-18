@@ -17,6 +17,9 @@ Usage:
 
   # All series except 5-8 (current run):
   python Training/Evaluate.py --lora-path /workspace/checkpoints/largev3_best --db /workspace/asr.db
+
+  # Cap the pool to March's 3436 chunks before the 15% split:
+  python Training/Evaluate.py --lora-path /workspace/checkpoints/largev3_best --series 1 3 4 10 --max-total 3436
 """
 import argparse
 import os
@@ -180,6 +183,8 @@ def main():
     parser.add_argument("--base-model", type=str, default="openai/whisper-large-v3")
     parser.add_argument("--series", type=int, nargs="+", default=None)
     parser.add_argument("--exclude", type=int, nargs="+", default=[5, 6, 7, 8])
+    parser.add_argument("--max-total", type=int, default=None,
+                        help="Cap the sample pool to N before the val split (default: all)")
     parser.add_argument("--max-val", type=int, default=None, help="Cap val eval to N samples (default: all)")
     args = parser.parse_args()
 
@@ -204,6 +209,11 @@ def main():
 
     random.seed(42)
     random.shuffle(all_samples)
+
+    if args.max_total and len(all_samples) > args.max_total:
+        all_samples = all_samples[:args.max_total]
+        print(f"Capped total to {len(all_samples)}")
+
     val_size = int(len(all_samples) * 0.15)
     val_samples = all_samples[:val_size]
     print(f"Total: {len(all_samples)}, Val: {len(val_samples)}")
