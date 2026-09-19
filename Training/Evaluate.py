@@ -109,9 +109,11 @@ def load_data_from_db(db_path, series_ids, chunks_dir):
         print(f"Skipped: {skipped}")
     return samples
 
-def evaluate(model, processor, samples, device):
+def evaluate(model, processor, samples, device, gen_config=None):
     model.eval()
-    gen_config = {"language": "ar", "task": "transcribe"}
+    if gen_config is None:
+        gen_config = {"language": "ar", "task": "transcribe"}
+    print(f"Generation config: {gen_config}")
     wer_scores, cer_scores, results = [], [], []
 
     with torch.no_grad():
@@ -186,6 +188,12 @@ def main():
     parser.add_argument("--max-total", type=int, default=None,
                         help="Cap the sample pool to N before the val split (default: all)")
     parser.add_argument("--max-val", type=int, default=None, help="Cap val eval to N samples (default: all)")
+    # Inference-time generation config
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=3,
+                        help="Block repeating n-grams of this size at decode time (0 disables)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Penalty on already-generated tokens (1.0 disables)")
+    parser.add_argument("--num-beams", type=int, default=1, help="Beam search width (1 = greedy)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -239,8 +247,17 @@ def main():
 
     model.eval()
 
+    # Inference-time generation config
+    gen_config = {"language": "ar", "task": "transcribe"}
+    if args.no_repeat_ngram_size:
+        gen_config["no_repeat_ngram_size"] = args.no_repeat_ngram_size
+    if args.repetition_penalty and args.repetition_penalty != 1.0:
+        gen_config["repetition_penalty"] = args.repetition_penalty
+    if args.num_beams and args.num_beams > 1:
+        gen_config["num_beams"] = args.num_beams
+
     # Run eval
-    val_wer, val_cer = evaluate(model, processor, val_samples, device)
+    val_wer, val_cer = evaluate(model, processor, val_samples, device, gen_config)
     print(f"\nFinal Val WER: {val_wer:.4f}")
     print(f"Final Val CER: {val_cer:.4f}")
 
