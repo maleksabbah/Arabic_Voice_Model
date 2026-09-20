@@ -1,11 +1,10 @@
 """
 Whisper Large V3 + LoRA Training on A100
-No torchcodec, no datasets Audio — loads WAV files directly with soundfile.
+Rank 128 run — March methodology, fc1/fc2 included.
 """
 import os, re, json, random, sqlite3, argparse
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
 import soundfile as sf
 from pathlib import Path
 from datetime import datetime
@@ -18,21 +17,18 @@ SOURCE_MODEL = "openai/whisper-large-v3"
 CHUNKS_DIR = "/workspace/chunks"
 DB_PATH = "/workspace/asr.db"
 CHECKPOINTS_DIR = "/workspace/checkpoints"
-SERIES_IDS = None  # Set via --series flag, or loads all series with transcriptions
 
 EPOCHS = 3
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5
 GRADIENT_CLIP = 1.0
-ACCUMULATION_STEPS = 1
-BATCH_SIZE = 16
-NUM_WORKERS = 4
+ACCUMULATION_STEPS = 4
+BATCH_SIZE = 4
 WARMUP_STEPS = 200
 VALIDATION_SPLIT = 0.15
-VAL_SAMPLES = 500
 SEED = 42
 
-LORA_RANK = 32
-LORA_ALPHA = 64
+LORA_RANK = 128
+LORA_ALPHA = 256
 LORA_DROPOUT = 0.05
 TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "o_proj", "fc1", "fc2"]
 
@@ -111,42 +107,19 @@ def load_data_from_db(db_path, series_ids, chunks_dir):
         print(f"Skipped: {skipped}")
     return samples
 
-class ChunkDataset(Dataset):
-    """Same filtering as the old prepare_sample, but CPU-only so it can run in workers."""
-    def __init__(self, samples, processor):
-        self.samples = samples
-        self.processor = processor
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        text = normalize_arabic(sample["text"])
-        if not text or len(text.strip()) < 2:
-            return None
-        try:
-            audio = load_audio(sample["audio_path"])
-        except Exception:
-            return None
-        input_features = self.processor(audio, sampling_rate=16000, return_tensors="pt").input_features[0]
-        labels = self.processor.tokenizer(text, return_tensors="pt").input_ids[0]
-        if labels.shape[0] > 448:
-            return None
-        return input_features, labels
-
-
-def collate_batch(batch):
-    n_bad = sum(1 for b in batch if b is None)
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return None, None, 0, n_bad
-    input_features = torch.stack([b[0] for b in batch])
-    max_len = max(b[1].shape[0] for b in batch)
-    padded_labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
-    for i, (_, l) in enumerate(batch):
-        padded_labels[i, :l.shape[0]] = l
-    return input_features, padded_labels, len(batch), n_bad
+def prepare_sample(sample, processor, device):
+    text = normalize_arabic(sample["text"])
+    if not text or len(text.strip()) < 2:
+        return None
+    try:
+        audio = load_audio(sample["audio_path"])
+    except Exception:
+        return None
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt").to(device)
+    labels = processor.tokenizer(text, return_tensors="pt").input_ids.to(device)
+    if labels.shape[1] > 448:
+        return None
+    return inputs.input_features, labels
 
 def evaluate(model, processor, samples, device, gen_config):
     model.eval()
@@ -194,6 +167,7 @@ def evaluate(model, processor, samples, device, gen_config):
 
 def main():
     global DB_PATH, CHUNKS_DIR, EPOCHS, LEARNING_RATE, LORA_RANK, LORA_ALPHA
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=str, default=DB_PATH)
     parser.add_argument("--chunks-dir", type=str, default=CHUNKS_DIR)
@@ -224,6 +198,7 @@ def main():
     print(f"Device: {device}")
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -254,16 +229,7 @@ def main():
     val_size = int(len(all_samples) * VALIDATION_SPLIT)
     val_samples = all_samples[:val_size]
     train_samples = all_samples[val_size:]
-    # Held-out set stays at VALIDATION_SPLIT; only a fixed random subset is scored each epoch
-    # so that per-epoch WER stays comparable and best-checkpoint selection is not sampling noise.
-    val_eval_samples = random.sample(val_samples, min(VAL_SAMPLES, len(val_samples)))
-    print(f"Train: {len(train_samples):,}, Val: {len(val_samples):,} (evaluating {len(val_eval_samples):,} of them)")
-
-    train_loader = DataLoader(
-        ChunkDataset(train_samples, processor),
-        batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
-        collate_fn=collate_batch, pin_memory=True, persistent_workers=NUM_WORKERS > 0,
-    )
+    print(f"Train: {len(train_samples):,}, Val: {len(val_samples):,}")
 
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, weight_decay=0.01)
     total_steps = (len(train_samples) * EPOCHS) // (ACCUMULATION_STEPS * BATCH_SIZE)
@@ -283,27 +249,40 @@ def main():
 
     for epoch in range(EPOCHS):
         print(f"\n{'='*80}\nEPOCH {epoch+1}/{EPOCHS}\n{'='*80}")
-        torch.manual_seed(SEED + epoch)
+        random.seed(SEED + epoch)
+        epoch_indices = list(range(len(train_samples)))
+        random.shuffle(epoch_indices)
         epoch_losses, skipped, processed = [], 0, 0
         model.train()
         optimizer.zero_grad()
-        num_batches = len(train_loader)
-        bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", ncols=120, total=num_batches)
+        num_batches = (len(epoch_indices) + BATCH_SIZE - 1) // BATCH_SIZE
+        bar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{EPOCHS}", ncols=120)
 
-        for batch_idx, batch in enumerate(bar):
+        for batch_idx in bar:
+            batch_start = batch_idx * BATCH_SIZE
+            batch_slice = epoch_indices[batch_start:batch_start + BATCH_SIZE]
             try:
-                input_features, padded_labels, n_ok, n_bad = batch
-                skipped += n_bad
-                if n_ok == 0: continue
-                input_features = input_features.to(device, non_blocking=True)
-                padded_labels = padded_labels.to(device, non_blocking=True)
+                input_list, label_list = [], []
+                for idx in batch_slice:
+                    prepared = prepare_sample(train_samples[idx], processor, device)
+                    if prepared is None:
+                        skipped += 1
+                        continue
+                    input_list.append(prepared[0])
+                    label_list.append(prepared[1])
+                if not input_list: continue
+                input_features = torch.cat(input_list, dim=0)
+                max_len = max(l.shape[1] for l in label_list)
+                padded_labels = torch.full((len(label_list), max_len), -100, dtype=torch.long, device=device)
+                for i, l in enumerate(label_list):
+                    padded_labels[i, :l.shape[1]] = l[0]
                 with torch.amp.autocast('cuda'):
                     out = model(input_features=input_features, labels=padded_labels)
                     loss = out.loss / ACCUMULATION_STEPS
                 scaler.scale(loss).backward()
                 loss_val = out.loss.item()
                 epoch_losses.append(loss_val)
-                processed += n_ok
+                processed += len(input_list)
                 if ((batch_idx + 1) % ACCUMULATION_STEPS == 0) or (batch_idx == num_batches - 1):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
@@ -325,7 +304,7 @@ def main():
         print(f"Processed: {processed}, Skipped: {skipped}")
 
         print("\nEvaluating...")
-        val_metrics = evaluate(model, processor, val_eval_samples, device, gen_config)
+        val_metrics = evaluate(model, processor, val_samples, device, gen_config)
 
         if val_metrics['wer'] < best_wer:
             best_wer = val_metrics['wer']
@@ -354,6 +333,122 @@ def main():
     print(f"\n{'='*80}")
     print(f"TRAINING COMPLETE! Best WER: {best_wer:.4f}")
     print(f"Merged model: {merged_dir}")
+    print(f"{'='*80}")
+
+    # ── BENCHMARKS ──
+    print(f"\n{'='*80}")
+    print(f"RUNNING BENCHMARKS")
+    print(f"{'='*80}")
+
+    from datasets import load_dataset
+
+    def safe_generate(m, inp, gc, dev):
+        with torch.amp.autocast('cuda'):
+            return m.generate(inp.input_features.to(dev), **gc)
+
+    def process_audio(sample):
+        audio = sample["audio"]
+        wav = np.array(audio["array"], dtype=np.float32)
+        sr = audio["sampling_rate"]
+        if sr != 16000:
+            import librosa
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=16000)
+        return wav, sr
+
+    def run_benchmark(m, proc, dev, name, dataset_id, config, split, ref_field, max_samples=200):
+        print(f"\n  [BENCH] {name}...")
+        m.eval()
+        gc = {"language": "ar", "task": "transcribe"}
+        try:
+            ds = load_dataset(dataset_id, config, split=split, trust_remote_code=True) if config else load_dataset(dataset_id, split=split, trust_remote_code=True)
+            indices = list(range(len(ds)))
+            np.random.seed(42)
+            np.random.shuffle(indices)
+            n = min(max_samples, len(ds))
+            wer_scores, cer_scores = [], []
+            with torch.no_grad():
+                for idx in tqdm(indices[:n], desc=f"  {name}", ncols=100, leave=False):
+                    try:
+                        sample = ds[idx]
+                        reference = normalize_arabic(sample[ref_field].strip())
+                        if not reference: continue
+                        wav, sr = process_audio(sample)
+                        inputs = proc(wav, sampling_rate=sr, return_tensors="pt").to(dev)
+                        pred_ids = safe_generate(m, inputs, gc, dev)
+                        prediction = normalize_arabic(proc.batch_decode(pred_ids, skip_special_tokens=True)[0].strip())
+                        w = wer(reference, prediction) if prediction else 1.0
+                        c2 = cer(reference, prediction) if prediction else 1.0
+                        wer_scores.append(w)
+                        cer_scores.append(c2)
+                    except: continue
+            r = {"wer": float(np.mean(wer_scores)) if wer_scores else 1.0, "cer": float(np.mean(cer_scores)) if cer_scores else 1.0, "total": len(wer_scores)}
+            print(f"  {name}: WER={r['wer']:.4f}, CER={r['cer']:.4f} (n={r['total']})")
+            return r
+        except Exception as e:
+            print(f"  {name}: FAILED — {e}")
+            return None
+
+    CASABLANCA_DIALECTS = ["Algeria", "Egypt", "Jordan", "Mauritania", "Morocco", "Palestine", "UAE", "Yemen"]
+
+    def run_casablanca(m, proc, dev, max_samples=200):
+        print(f"\n  [BENCH] Casablanca (8 dialects)...")
+        m.eval()
+        gc = {"language": "ar", "task": "transcribe"}
+        per_dialect = {}
+        all_wer, all_cer = [], []
+        samples_per = max(max_samples // len(CASABLANCA_DIALECTS), 10)
+        for dialect in CASABLANCA_DIALECTS:
+            try:
+                ds = load_dataset("UBC-NLP/Casablanca", dialect, split="test", trust_remote_code=True)
+            except Exception as e:
+                print(f"  Skipping {dialect}: {e}")
+                continue
+            indices = list(range(len(ds)))
+            np.random.seed(42)
+            np.random.shuffle(indices)
+            n = min(samples_per, len(ds))
+            wer_scores, cer_scores = [], []
+            with torch.no_grad():
+                for idx in tqdm(indices[:n], desc=f"  Casa-{dialect[:3]}", ncols=100, leave=False):
+                    try:
+                        sample = ds[idx]
+                        reference = normalize_arabic(sample.get("transcription", sample.get("sentence", "")).strip())
+                        if not reference: continue
+                        wav, sr = process_audio(sample)
+                        inputs = proc(wav, sampling_rate=sr, return_tensors="pt").to(dev)
+                        pred_ids = safe_generate(m, inputs, gc, dev)
+                        prediction = normalize_arabic(proc.batch_decode(pred_ids, skip_special_tokens=True)[0].strip())
+                        w = wer(reference, prediction) if prediction else 1.0
+                        c2 = cer(reference, prediction) if prediction else 1.0
+                        wer_scores.append(w)
+                        cer_scores.append(c2)
+                    except: continue
+            if wer_scores:
+                d_wer = float(np.mean(wer_scores))
+                per_dialect[dialect] = {"wer": d_wer, "cer": float(np.mean(cer_scores)), "total": len(wer_scores)}
+                all_wer.extend(wer_scores)
+                all_cer.extend(cer_scores)
+                print(f"  Casablanca-{dialect}: WER={d_wer:.4f} (n={len(wer_scores)})")
+        r = {"wer": float(np.mean(all_wer)) if all_wer else 1.0, "cer": float(np.mean(all_cer)) if all_cer else 1.0, "total": len(all_wer), "per_dialect": per_dialect}
+        print(f"  Casablanca AVG: WER={r['wer']:.4f} ({r['total']} samples)")
+        return r
+
+    # Run on merged model
+    merged_model.eval()
+    bench_results = {}
+    bench_results["fleurs"] = run_benchmark(merged_model, processor, device, "FLEURS (MSA)", "google/fleurs", "ar_eg", "test", "transcription", 200)
+    bench_results["mgb3"] = run_benchmark(merged_model, processor, device, "MGB-3 (Egyptian)", "MightyStudent/Egyptian-ASR-MGB-3", None, "train", "sentence", 200)
+    bench_results["casablanca"] = run_casablanca(merged_model, processor, device, 200)
+
+    print(f"\n{'='*80}")
+    print(f"BENCHMARK RESULTS")
+    print(f"{'='*80}")
+    for name, r in bench_results.items():
+        if r:
+            print(f"  {name}: WER={r['wer']:.4f}, CER={r['cer']:.4f} (n={r['total']})")
+    valid = [r["wer"] for r in bench_results.values() if r and r.get("total", 0) > 0]
+    avg = float(np.mean(valid)) if valid else 1.0
+    print(f"  AVERAGE: {avg:.4f}")
     print(f"{'='*80}")
 
 if __name__ == "__main__":
