@@ -265,7 +265,8 @@ def main():
     val_size = int(len(all_samples) * VALIDATION_SPLIT)
     val_samples = all_samples[:val_size]
     train_samples = all_samples[val_size:]
-    print(f"Train: {len(train_samples):,}, Val: {len(val_samples):,}")
+    val_eval_samples = random.sample(val_samples, min(500, len(val_samples)))
+    print(f"Train: {len(train_samples):,}, Val: {len(val_samples):,} (evaluating {len(val_eval_samples)} of them)")
 
     train_loader = TorchDataLoader(
         ChunkDataset(train_samples, processor),
@@ -318,6 +319,12 @@ def main():
                     optimizer.zero_grad()
                 if batch_idx % 25 == 0:
                     bar.set_postfix({'loss': f"{loss_val:.3f}", 'avg': f"{np.mean(epoch_losses[-50:]):.3f}", 'lr': f"{scheduler.get_last_lr()[0]:.2e}"})
+                if (batch_idx + 1) % 500 == 0:
+                    step_dir = run_dir / f"step_{epoch+1}_{batch_idx+1}"
+                    step_dir.mkdir(exist_ok=True)
+                    model.save_pretrained(str(step_dir))
+                    processor.save_pretrained(str(step_dir))
+                    print(f"\n   [CHECKPOINT] Saved at epoch {epoch+1} step {batch_idx+1}")
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     torch.cuda.empty_cache()
@@ -330,7 +337,7 @@ def main():
         print(f"Processed: {processed}, Skipped: {skipped}")
 
         print("\nEvaluating...")
-        val_metrics = evaluate(model, processor, val_samples, device, gen_config)
+        val_metrics = evaluate(model, processor, val_eval_samples, device, gen_config)
 
         if val_metrics['wer'] < best_wer:
             best_wer = val_metrics['wer']
