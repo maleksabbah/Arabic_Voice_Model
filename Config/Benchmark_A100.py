@@ -4,9 +4,20 @@ Arabic ASR Benchmark Suite — All HuggingFace benchmarks
 Runs 5 of 8 Open Universal Arabic ASR Leaderboard benchmarks:
   1. FLEURS        — MSA clean read speech
   2. MGB-3         — Egyptian dialect
-  3. MGB-2         — Multi-dialect broadcast (gated, needs HF login)
+  3. MGB-2         — Multi-dialect broadcast (gated: accept QCRI/mgb2 on the Hub)
   4. Casablanca    — 8 Arabic dialects
-  5. Common Voice  — MSA crowd-sourced (gated, needs HF login)
+  5. Common Voice  — MSA crowd-sourced
+
+MGB-2 ships as a Kaldi directory, not a HuggingFace dataset — tarballs with
+wav/, segments.non_overlap_speech and text.non_overlap_speech. The suite
+downloads and extracts test.tar.gz (1.0 GB) to --mgb2-dir on first use and
+slices the 5,365 non-overlap segments out of the 17 program wavs, which is
+the configuration QCRI's README specifies for reproducing MGB-2 test results.
+
+Common Voice: mozilla-foundation stopped hosting the data (its common_voice_17_0
+repo is empty and there is no common_voice_18_0), so `cv17` reads the fixie-ai
+mirror, which is ungated. `cv18` reads fsicoli/common_voice_18_0 and is not in
+the default set — it is gated, so request access on its Hub page before using it.
 
 Usage:
   # Full suite against merged model:
@@ -27,7 +38,9 @@ Usage:
 import argparse
 import re
 import os
+import tarfile
 import torch
+import soundfile as sf
 import numpy as np
 from jiwer import wer, cer
 from tqdm import tqdm
@@ -164,18 +177,110 @@ def run_casablanca(model, processor, device, max_samples=200):
     print(f"  Casablanca AVG: Mean WER={mean_wer:.4f} | Corpus WER={corpus_wer_val:.4f} ({r['total']} samples)")
     return r
 
+MGB2_REPO = "QCRI/mgb2"
+MGB2_DEFAULT_DIR = "/workspace/benchmarks/test"
+
+def ensure_mgb2(mgb2_dir):
+    """Download and extract QCRI/mgb2 test.tar.gz unless mgb2_dir already holds it."""
+    if os.path.exists(os.path.join(mgb2_dir, "segments.non_overlap_speech")):
+        return
+    from huggingface_hub import hf_hub_download
+    parent = os.path.dirname(os.path.abspath(mgb2_dir))
+    os.makedirs(parent, exist_ok=True)
+    print(f"  MGB-2 not found at {mgb2_dir} — downloading test.tar.gz (1.0 GB)...")
+    tar_path = hf_hub_download(MGB2_REPO, "test/test.tar.gz", repo_type="dataset",
+                               cache_dir=os.path.join(parent, "hf_cache"))
+    print(f"  Extracting to {parent}/ ...")
+    with tarfile.open(tar_path, "r:gz") as tf:
+        # set_attrs=False: the network volume rejects chown, which aborts a plain extractall
+        for member in tf:
+            tf.extract(member, parent, set_attrs=False)
+
+def load_mgb2_segments(mgb2_dir):
+    """The 5,365 non-overlap segments: (utt_id, recording_id, start_s, end_s, reference)."""
+    texts = {}
+    with open(os.path.join(mgb2_dir, "text.non_overlap_speech"), encoding="utf-8") as f:
+        for line in f:
+            utt_id, _, transcript = line.partition(" ")
+            transcript = transcript.strip()
+            if transcript:
+                texts[utt_id] = transcript
+    segments = []
+    with open(os.path.join(mgb2_dir, "segments.non_overlap_speech"), encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            utt_id, rec_id, start, end = parts
+            if utt_id in texts:
+                segments.append((utt_id, rec_id, float(start), float(end), texts[utt_id]))
+    return segments
+
+def run_mgb2(model, processor, device, max_samples=200, mgb2_dir=MGB2_DEFAULT_DIR):
+    print(f"\n  [BENCH] MGB-2 (Multi-dialect broadcast)...")
+    model.eval()
+    gen_config = {"language": "ar", "task": "transcribe"}
+    try:
+        ensure_mgb2(mgb2_dir)
+        segments = load_mgb2_segments(mgb2_dir)
+    except Exception as e:
+        print(f"  MGB-2: FAILED — {e}")
+        return None
+    np.random.seed(42)
+    np.random.shuffle(segments)
+    n = min(max_samples, len(segments))
+    wer_scores, cer_scores = [], []
+    all_refs, all_preds = [], []
+    with torch.no_grad():
+        for utt_id, rec_id, start, end, raw_ref in tqdm(segments[:n], desc="  MGB-2", ncols=100, leave=False):
+            try:
+                reference = normalize_arabic(raw_ref)
+                if not reference: continue
+                wav_path = os.path.join(mgb2_dir, "wav", f"{rec_id}.wav")
+                sr = sf.info(wav_path).samplerate
+                wav, sr = sf.read(wav_path, start=int(start * sr), stop=int(end * sr), dtype="float32")
+                if wav.ndim > 1:
+                    wav = wav.mean(axis=1)
+                if sr != 16000:
+                    import librosa
+                    wav = librosa.resample(wav, orig_sr=sr, target_sr=16000)
+                    sr = 16000
+                inputs = processor(wav, sampling_rate=sr, return_tensors="pt").to(device)
+                with torch.amp.autocast('cuda'):
+                    pred_ids = model.generate(inputs.input_features.to(device), **gen_config)
+                prediction = normalize_arabic(processor.batch_decode(pred_ids, skip_special_tokens=True)[0].strip())
+                wer_scores.append(wer(reference, prediction) if prediction else 1.0)
+                cer_scores.append(cer(reference, prediction) if prediction else 1.0)
+                all_refs.append(reference)
+                all_preds.append(prediction)
+            except Exception:
+                continue
+    mean_wer = float(np.mean(wer_scores)) if wer_scores else 1.0
+    mean_cer = float(np.mean(cer_scores)) if cer_scores else 1.0
+    corpus_wer_val = wer(all_refs, all_preds) if all_refs else 1.0
+    corpus_cer_val = cer(all_refs, all_preds) if all_refs else 1.0
+    r = {
+        "mean_wer": mean_wer, "mean_cer": mean_cer,
+        "corpus_wer": corpus_wer_val, "corpus_cer": corpus_cer_val,
+        "total": len(wer_scores)
+    }
+    print(f"  MGB-2 (Multi-dialect): Mean WER={mean_wer:.4f} | Corpus WER={corpus_wer_val:.4f} | CER={mean_cer:.4f} (n={r['total']})")
+    return r
+
 ALL_BENCHMARKS = {
     "fleurs": {"name": "FLEURS (MSA)", "dataset": "google/fleurs", "config": "ar_eg", "split": "test", "ref": "transcription"},
     "mgb3": {"name": "MGB-3 (Egyptian)", "dataset": "MightyStudent/Egyptian-ASR-MGB-3", "config": None, "split": "train", "ref": "sentence"},
-    "mgb2": {"name": "MGB-2 (Multi-dialect)", "dataset": "QCRI/mgb2", "config": None, "split": "test", "ref": "text"},
-    "cv18": {"name": "Common Voice 18 (MSA)", "dataset": "mozilla-foundation/common_voice_18_0", "config": "ar", "split": "test", "ref": "sentence"},
+    "cv17": {"name": "Common Voice 17 (MSA)", "dataset": "fixie-ai/common_voice_17_0", "config": "ar", "split": "test", "ref": "sentence"},
+    "cv18": {"name": "Common Voice 18 (MSA)", "dataset": "fsicoli/common_voice_18_0", "config": "ar", "split": "test", "ref": "sentence"},
 }
 
-def run_all(model, processor, device, max_samples, benchmark_names):
+def run_all(model, processor, device, max_samples, benchmark_names, mgb2_dir=MGB2_DEFAULT_DIR):
     results = {}
     for key in benchmark_names:
         if key == "casablanca":
             results["casablanca"] = run_casablanca(model, processor, device, max_samples)
+        elif key == "mgb2":
+            results["mgb2"] = run_mgb2(model, processor, device, max_samples, mgb2_dir)
         elif key in ALL_BENCHMARKS:
             b = ALL_BENCHMARKS[key]
             results[key] = run_single_benchmark(model, processor, device, b["name"], b["dataset"], b["config"], b["split"], b["ref"], max_samples)
@@ -232,7 +337,9 @@ def main():
     parser.add_argument("--base-model", type=str, default="openai/whisper-large-v3")
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--skip-base", action="store_true")
-    parser.add_argument("--benchmarks", type=str, nargs="+", default=["fleurs", "mgb3", "mgb2", "casablanca", "cv18"])
+    parser.add_argument("--benchmarks", type=str, nargs="+", default=["fleurs", "mgb3", "mgb2", "casablanca", "cv17"])
+    parser.add_argument("--mgb2-dir", type=str, default=MGB2_DEFAULT_DIR,
+                        help="Extracted MGB-2 Kaldi test dir; downloaded here if missing")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -255,7 +362,7 @@ def main():
         print(f"{'='*80}")
         base_model = WhisperForConditionalGeneration.from_pretrained(args.base_model).to(device)
         base_model.eval()
-        base_results = run_all(base_model, processor, device, args.samples, args.benchmarks)
+        base_results = run_all(base_model, processor, device, args.samples, args.benchmarks, args.mgb2_dir)
         print_results(base_results, f"BASELINE: {args.base_model}")
         del base_model
         torch.cuda.empty_cache()
@@ -280,7 +387,7 @@ def main():
         print("No --lora-path or --merged-path provided. Only base model benchmarked.")
         return
 
-    trained_results = run_all(t_model, t_processor, device, args.samples, args.benchmarks)
+    trained_results = run_all(t_model, t_processor, device, args.samples, args.benchmarks, args.mgb2_dir)
     print_results(trained_results, "TRAINED MODEL")
     del t_model
     torch.cuda.empty_cache()
