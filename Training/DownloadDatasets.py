@@ -298,7 +298,7 @@ def download_casablanca():
     print("Downloading Casablanca (8 dialects)...")
     print("="*60)
 
-    dialects = ["Algeria", "Egypt", "Emirate", "Jordan", "Mauritania", "Morocco", "Palestine", "Yemen"]
+    dialects = ["Algeria", "Egypt", "Jordan", "Mauritania", "Morocco", "Palestine", "UAE", "Yemen"]
     all_val = []
     all_test = []
 
