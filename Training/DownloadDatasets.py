@@ -2,20 +2,23 @@
 Dataset Download & Preprocessing Pipeline
 for w2v-BERT 2.0 Arabic Dialect ASR Probe
 
-Training: MGB-2, MGB-3, Casablanca train
-Evaluation: Casablanca test, MGB-2 test, FLEURS Arabic
+Training: MGB-2 (train), MGB-3 (Egyptian), Casablanca (val split)
+Evaluation: Casablanca (test), MGB-2 (test), FLEURS Arabic
 
+MGB-2 is Kaldi format (tar.gz with segments/text/wav files).
+Other datasets load via HuggingFace datasets library.
 All audio resampled to 16kHz mono.
-Output: HuggingFace Dataset format on disk.
 """
 
 import os
-import torch
-import torchaudio
-from datasets import load_dataset, Audio, concatenate_datasets, DatasetDict
-from huggingface_hub import login
+import tarfile
+import soundfile as sf
+import numpy as np
+import json
 import re
-import unicodedata
+from pathlib import Path
+from huggingface_hub import login, hf_hub_download
+from datasets import load_dataset, Audio, concatenate_datasets, Dataset, DatasetDict
 
 # ============================================================
 # CONFIG
@@ -30,8 +33,8 @@ if HF_TOKEN:
     login(token=HF_TOKEN)
     print("Logged into HuggingFace")
 else:
-    print("No HF_TOKEN set — will only work for non-gated datasets")
-    print("Set it with: export HF_TOKEN=your_token_here")
+    print("WARNING: No HF_TOKEN set — MGB-2 will fail")
+    print("Set with: export HF_TOKEN=your_token_here")
 
 
 # ============================================================
@@ -41,59 +44,247 @@ def normalize_arabic(text):
     """Normalize Arabic text for CTC training."""
     if not text or not isinstance(text, str):
         return ""
-
     # Remove diacritics (tashkeel)
     text = re.sub(r'[ؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۤۧۨ-ۭ]', '', text)
-
     # Normalize alef variants to bare alef
     text = re.sub(r'[إأآا]', 'ا', text)
-
     # Normalize teh marbuta to heh
     text = text.replace('ة', 'ه')
-
     # Normalize alef maksura to yeh
     text = text.replace('ى', 'ي')
-
     # Remove tatweel
     text = text.replace('ـ', '')
-
     # Remove non-Arabic, non-space characters (keep Arabic letters + spaces)
     text = re.sub(r'[^ء-ي٠-٩\s]', '', text)
-
     # Collapse multiple spaces
     text = re.sub(r'\s+', ' ', text).strip()
-
     return text
 
 
 # ============================================================
-# DOWNLOAD FUNCTIONS
+# MGB-2: Kaldi format via hf_hub_download
 # ============================================================
+MGB2_REPO = "QCRI/mgb2"
 
-def download_mgb2():
-    """Download MGB-2 dataset (1,200h broadcast Arabic). Requires HF access."""
-    print("\n" + "="*60)
-    print("Downloading MGB-2...")
-    print("="*60)
+def download_mgb2_split(split_name):
+    """
+    Download and extract an MGB-2 split (train or test).
+    Returns the extracted directory path.
+    """
+    extract_dir = os.path.join(OUTPUT_DIR, "mgb2_raw")
+    split_dir = os.path.join(extract_dir, split_name)
 
+    # Check if already extracted
+    segments_file = os.path.join(split_dir, "segments.non_overlap_speech") if split_name == "test" else os.path.join(split_dir, "segments")
+    if os.path.exists(segments_file):
+        print(f"  MGB-2 {split_name} already extracted at {split_dir}")
+        return split_dir
+
+    os.makedirs(extract_dir, exist_ok=True)
+
+    print(f"  Downloading MGB-2 {split_name}.tar.gz ...")
     try:
-        ds = load_dataset("QCRI/mgb2", trust_remote_code=True, token=HF_TOKEN)
-        print(f"MGB-2 loaded: {ds}")
-        return ds
+        tar_path = hf_hub_download(
+            MGB2_REPO,
+            f"{split_name}/{split_name}.tar.gz",
+            repo_type="dataset",
+            cache_dir=os.path.join(extract_dir, "hf_cache"),
+            token=HF_TOKEN,
+        )
     except Exception as e:
-        print(f"MGB-2 download failed: {e}")
-        print("Make sure you have access at https://huggingface.co/datasets/QCRI/mgb2")
-        return None
+        print(f"  Failed to download {split_name}.tar.gz: {e}")
+        # Try without subdirectory
+        try:
+            tar_path = hf_hub_download(
+                MGB2_REPO,
+                f"{split_name}.tar.gz",
+                repo_type="dataset",
+                cache_dir=os.path.join(extract_dir, "hf_cache"),
+                token=HF_TOKEN,
+            )
+        except Exception as e2:
+            print(f"  Also failed: {e2}")
+            return None
 
+    print(f"  Extracting to {extract_dir}/ ...")
+    with tarfile.open(tar_path, "r:gz") as tf:
+        for member in tf:
+            tf.extract(member, extract_dir, set_attrs=False)
+
+    return split_dir
+
+
+def load_mgb2_segments(mgb2_dir, split_type="test"):
+    """
+    Load MGB-2 segments from Kaldi-format files.
+    Returns list of (utt_id, recording_id, start_s, end_s, transcript).
+    """
+    # Determine file names based on split
+    if split_type == "test":
+        text_file = os.path.join(mgb2_dir, "text.non_overlap_speech")
+        segments_file = os.path.join(mgb2_dir, "segments.non_overlap_speech")
+    else:
+        text_file = os.path.join(mgb2_dir, "text")
+        segments_file = os.path.join(mgb2_dir, "segments")
+
+    if not os.path.exists(text_file) or not os.path.exists(segments_file):
+        print(f"  Missing files: text={os.path.exists(text_file)}, segments={os.path.exists(segments_file)}")
+        # List what's actually in the directory
+        if os.path.exists(mgb2_dir):
+            print(f"  Contents of {mgb2_dir}: {os.listdir(mgb2_dir)}")
+        return []
+
+    # Load texts
+    texts = {}
+    with open(text_file, encoding="utf-8") as f:
+        for line in f:
+            utt_id, _, transcript = line.partition(" ")
+            transcript = transcript.strip()
+            if transcript:
+                texts[utt_id] = transcript
+
+    # Load segments
+    segments = []
+    with open(segments_file, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            utt_id, rec_id, start, end = parts
+            if utt_id in texts:
+                segments.append((utt_id, rec_id, float(start), float(end), texts[utt_id]))
+
+    print(f"  Loaded {len(segments)} segments from {mgb2_dir}")
+    return segments
+
+
+def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=None):
+    """
+    Extract audio segments from MGB-2 wav files and save as individual files.
+    Creates a manifest JSON for later loading.
+    """
+    os.makedirs(output_path, exist_ok=True)
+    manifest = []
+
+    # Find wav.scp or wav files
+    wav_scp = os.path.join(mgb2_dir, "wav.scp")
+    wav_paths = {}
+
+    if os.path.exists(wav_scp):
+        with open(wav_scp) as f:
+            for line in f:
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2:
+                    wav_paths[parts[0]] = parts[1]
+    else:
+        # Look for wav files directly
+        for f in Path(mgb2_dir).rglob("*.wav"):
+            wav_paths[f.stem] = str(f)
+
+    if not wav_paths:
+        print(f"  No wav files found in {mgb2_dir}")
+        print(f"  Contents: {os.listdir(mgb2_dir)[:20]}")
+        return []
+
+    print(f"  Found {len(wav_paths)} recordings")
+
+    if max_segments:
+        segments = segments[:max_segments]
+
+    loaded_recordings = {}
+    skipped = 0
+
+    for i, (utt_id, rec_id, start, end, transcript) in enumerate(segments):
+        if rec_id not in wav_paths:
+            skipped += 1
+            continue
+
+        # Load recording (cache it)
+        if rec_id not in loaded_recordings:
+            wav_path = wav_paths[rec_id]
+            try:
+                audio, sr = sf.read(wav_path)
+                if sr != SAMPLE_RATE:
+                    import torchaudio
+                    import torch
+                    audio_t = torch.tensor(audio).float()
+                    if audio_t.dim() == 1:
+                        audio_t = audio_t.unsqueeze(0)
+                    resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
+                    audio_t = resampler(audio_t)
+                    audio = audio_t.squeeze().numpy()
+                    sr = SAMPLE_RATE
+                loaded_recordings[rec_id] = (audio, sr)
+            except Exception as e:
+                print(f"  Error loading {wav_path}: {e}")
+                skipped += 1
+                continue
+
+        audio, sr = loaded_recordings[rec_id]
+
+        # Extract segment
+        start_sample = int(start * sr)
+        end_sample = int(end * sr)
+        segment_audio = audio[start_sample:end_sample]
+
+        if len(segment_audio) < sr * 0.1:  # Skip segments < 0.1s
+            skipped += 1
+            continue
+
+        # Save segment
+        out_file = os.path.join(output_path, f"{utt_id}.wav")
+        sf.write(out_file, segment_audio, sr)
+
+        normalized = normalize_arabic(transcript)
+        if normalized:
+            manifest.append({
+                "audio_path": out_file,
+                "text": normalized,
+                "utt_id": utt_id,
+                "duration": end - start,
+            })
+
+        if (i + 1) % 5000 == 0:
+            print(f"    Processed {i+1}/{len(segments)} segments...")
+
+        # Free memory for large recordings
+        if len(loaded_recordings) > 50:
+            oldest = list(loaded_recordings.keys())[0]
+            del loaded_recordings[oldest]
+
+    # Save manifest
+    manifest_path = os.path.join(output_path, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    print(f"  Saved {len(manifest)} segments to {output_path} (skipped {skipped})")
+    return manifest
+
+
+def manifest_to_dataset(manifest_path):
+    """Convert a manifest JSON to a HuggingFace Dataset."""
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    ds = Dataset.from_dict({
+        "audio": [item["audio_path"] for item in manifest],
+        "normalized_text": [item["text"] for item in manifest],
+    })
+    ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+    return ds
+
+
+# ============================================================
+# OTHER DATASETS: HuggingFace
+# ============================================================
 
 def download_mgb3():
     """Download MGB-3 Egyptian dialect (16h)."""
     print("\n" + "="*60)
     print("Downloading MGB-3 (Egyptian)...")
     print("="*60)
-
     try:
-        ds = load_dataset("MightyStudent/Egyptian-ASR-MGB-3", trust_remote_code=True)
+        ds = load_dataset("MightyStudent/Egyptian-ASR-MGB-3")
         print(f"MGB-3 loaded: {ds}")
         return ds
     except Exception as e:
@@ -113,15 +304,14 @@ def download_casablanca():
 
     for dialect in dialects:
         try:
-            ds = load_dataset("UBC-NLP/Casablanca", dialect, trust_remote_code=True)
+            ds = load_dataset("UBC-NLP/Casablanca", dialect)
             print(f"  {dialect}: {ds}")
 
-            # Add dialect column
             if "validation" in ds:
-                val = ds["validation"].map(lambda x: {"dialect": dialect})
+                val = ds["validation"].map(lambda x, d=dialect: {"dialect": d})
                 all_val.append(val)
             if "test" in ds:
-                test = ds["test"].map(lambda x: {"dialect": dialect})
+                test = ds["test"].map(lambda x, d=dialect: {"dialect": d})
                 all_test.append(test)
         except Exception as e:
             print(f"  {dialect} failed: {e}")
@@ -141,9 +331,8 @@ def download_fleurs():
     print("\n" + "="*60)
     print("Downloading FLEURS Arabic...")
     print("="*60)
-
     try:
-        ds = load_dataset("google/fleurs", "ar_eg", split="test", trust_remote_code=True)
+        ds = load_dataset("google/fleurs", "ar_eg", split="test")
         print(f"FLEURS loaded: {len(ds)} samples")
         return ds
     except Exception as e:
@@ -152,19 +341,13 @@ def download_fleurs():
 
 
 # ============================================================
-# PREPROCESSING
+# PREPROCESSING (for HuggingFace datasets)
 # ============================================================
 
 def preprocess_dataset(dataset, audio_col="audio", text_col="sentence", name="unknown"):
-    """
-    Standardize a dataset:
-    - Resample audio to 16kHz
-    - Normalize Arabic text
-    - Remove empty/too-short samples
-    """
+    """Standardize a HF dataset: resample, normalize text, filter empty."""
     print(f"\nPreprocessing {name}...")
 
-    # Try to find the right column names
     cols = dataset.column_names if hasattr(dataset, 'column_names') else []
 
     # Find audio column
@@ -176,33 +359,29 @@ def preprocess_dataset(dataset, audio_col="audio", text_col="sentence", name="un
 
     # Find text column
     if text_col not in cols:
-        for candidate in ["sentence", "transcription", "text", "transcript", "Transcription"]:
+        for candidate in ["sentence", "transcription", "text", "transcript"]:
             if candidate in cols:
                 text_col = candidate
                 break
 
     print(f"  Using columns: audio='{audio_col}', text='{text_col}'")
-    print(f"  Available columns: {cols}")
 
     # Cast audio to 16kHz
     dataset = dataset.cast_column(audio_col, Audio(sampling_rate=SAMPLE_RATE))
 
-    # Normalize text and filter
+    # Normalize text
     def process(batch):
-        text = batch.get(text_col, "")
-        normalized = normalize_arabic(text)
-        batch["normalized_text"] = normalized
+        batch["normalized_text"] = normalize_arabic(batch.get(text_col, ""))
         return batch
 
     dataset = dataset.map(process)
 
-    # Filter out empty transcriptions
+    # Filter empty
     before = len(dataset)
     dataset = dataset.filter(lambda x: len(x["normalized_text"].strip()) > 0)
     after = len(dataset)
-    print(f"  Filtered: {before} -> {after} samples ({before - after} removed)")
+    print(f"  Filtered: {before} -> {after} ({before - after} removed)")
 
-    # Rename columns for consistency
     if audio_col != "audio":
         dataset = dataset.rename_column(audio_col, "audio")
 
@@ -220,44 +399,61 @@ def main():
     print(f"Sample rate: {SAMPLE_RATE}Hz")
     print("="*60)
 
-    # ---- TRAINING DATA ----
     train_datasets = []
 
-    # 1. MGB-2
-    mgb2 = download_mgb2()
-    if mgb2 is not None:
-        if "train" in mgb2:
-            mgb2_train = preprocess_dataset(mgb2["train"], name="MGB-2 train")
-            train_datasets.append(("mgb2", mgb2_train))
-            # Save MGB-2 test separately for evaluation
-            if "test" in mgb2:
-                mgb2_test = preprocess_dataset(mgb2["test"], name="MGB-2 test")
-                mgb2_test.save_to_disk(os.path.join(OUTPUT_DIR, "eval_mgb2_test"))
-                print(f"  Saved MGB-2 test to {OUTPUT_DIR}/eval_mgb2_test")
-        else:
-            # Some versions have different split names
-            print(f"  MGB-2 splits available: {list(mgb2.keys())}")
-            for split_name in mgb2.keys():
-                print(f"    {split_name}: {len(mgb2[split_name])} samples")
+    # ---- 1. MGB-2 (Kaldi format) ----
+    print("\n" + "="*60)
+    print("Processing MGB-2...")
+    print("="*60)
 
-    # 2. MGB-3 Egyptian
+    # Train split
+    mgb2_train_dir = download_mgb2_split("train")
+    if mgb2_train_dir:
+        segments = load_mgb2_segments(mgb2_train_dir, split_type="train")
+        if segments:
+            train_audio_dir = os.path.join(OUTPUT_DIR, "mgb2_train_audio")
+            manifest = mgb2_segments_to_audio_files(
+                mgb2_train_dir, segments, train_audio_dir
+            )
+            if manifest:
+                mgb2_train_ds = manifest_to_dataset(
+                    os.path.join(train_audio_dir, "manifest.json")
+                )
+                train_datasets.append(("mgb2", mgb2_train_ds))
+                print(f"  MGB-2 train: {len(mgb2_train_ds)} samples")
+
+    # Test split (for eval)
+    mgb2_test_dir = download_mgb2_split("test")
+    if mgb2_test_dir:
+        segments = load_mgb2_segments(mgb2_test_dir, split_type="test")
+        if segments:
+            test_audio_dir = os.path.join(OUTPUT_DIR, "mgb2_test_audio")
+            manifest = mgb2_segments_to_audio_files(
+                mgb2_test_dir, segments, test_audio_dir
+            )
+            if manifest:
+                mgb2_test_ds = manifest_to_dataset(
+                    os.path.join(test_audio_dir, "manifest.json")
+                )
+                mgb2_test_ds.save_to_disk(os.path.join(OUTPUT_DIR, "eval_mgb2_test"))
+                print(f"  MGB-2 test saved: {len(mgb2_test_ds)} samples")
+
+    # ---- 2. MGB-3 Egyptian ----
     mgb3 = download_mgb3()
     if mgb3 is not None:
-        # MGB-3 might have different split structure
-        for split in mgb3.keys() if isinstance(mgb3, dict) else ["train"]:
-            data = mgb3[split] if isinstance(mgb3, dict) else mgb3
-            mgb3_processed = preprocess_dataset(data, name=f"MGB-3 {split}")
-            train_datasets.append(("mgb3", mgb3_processed))
-            break  # Just get the training data
+        split_name = list(mgb3.keys())[0] if isinstance(mgb3, DatasetDict) else "train"
+        data = mgb3[split_name] if isinstance(mgb3, DatasetDict) else mgb3
+        mgb3_processed = preprocess_dataset(data, name="MGB-3")
+        train_datasets.append(("mgb3", mgb3_processed))
 
-    # 3. Casablanca (validation split for training, test for eval)
+    # ---- 3. Casablanca ----
     casablanca = download_casablanca()
     if casablanca is not None:
         if "validation" in casablanca:
             casa_train = preprocess_dataset(
                 casablanca["validation"],
                 text_col="transcription",
-                name="Casablanca train (validation split)"
+                name="Casablanca train (val split)"
             )
             train_datasets.append(("casablanca", casa_train))
 
@@ -268,14 +464,14 @@ def main():
                 name="Casablanca test"
             )
             casa_test.save_to_disk(os.path.join(OUTPUT_DIR, "eval_casablanca_test"))
-            print(f"  Saved Casablanca test to {OUTPUT_DIR}/eval_casablanca_test")
+            print(f"  Casablanca test saved")
 
-    # 4. FLEURS Arabic (eval only)
+    # ---- 4. FLEURS (eval only) ----
     fleurs = download_fleurs()
     if fleurs is not None:
-        fleurs_processed = preprocess_dataset(fleurs, text_col="transcription", name="FLEURS Arabic")
+        fleurs_processed = preprocess_dataset(fleurs, text_col="transcription", name="FLEURS")
         fleurs_processed.save_to_disk(os.path.join(OUTPUT_DIR, "eval_fleurs"))
-        print(f"  Saved FLEURS to {OUTPUT_DIR}/eval_fleurs")
+        print(f"  FLEURS saved")
 
     # ---- COMBINE TRAINING DATA ----
     if train_datasets:
@@ -283,10 +479,8 @@ def main():
         print("Combining training datasets...")
         print("="*60)
 
-        # Standardize columns before concatenation
         standardized = []
         for name, ds in train_datasets:
-            # Keep only audio and normalized_text
             keep_cols = ["audio", "normalized_text"]
             if "dialect" in ds.column_names:
                 keep_cols.append("dialect")
@@ -295,9 +489,7 @@ def main():
             if remove_cols:
                 ds = ds.remove_columns(remove_cols)
 
-            # Add source tag
-            ds = ds.map(lambda x: {"source": name})
-
+            ds = ds.map(lambda x, n=name: {"source": n})
             print(f"  {name}: {len(ds)} samples")
             standardized.append(ds)
 
@@ -306,22 +498,19 @@ def main():
 
         print(f"\nTotal training samples: {len(combined)}")
         combined.save_to_disk(os.path.join(OUTPUT_DIR, "train_combined"))
-        print(f"Saved combined training data to {OUTPUT_DIR}/train_combined")
+        print(f"Saved to {OUTPUT_DIR}/train_combined")
     else:
-        print("\nNo training datasets were loaded successfully!")
+        print("\nNo training datasets loaded!")
 
     # ---- SUMMARY ----
     print("\n" + "="*60)
     print("SUMMARY")
     print("="*60)
-
-    for folder in os.listdir(OUTPUT_DIR):
+    for folder in sorted(os.listdir(OUTPUT_DIR)):
         path = os.path.join(OUTPUT_DIR, folder)
         if os.path.isdir(path):
             print(f"  {folder}/")
-
-    print("\nDone! Next step: run the probe training script.")
-    print("  python train_probe.py")
+    print("\nDone. Next: python train_probe.py")
 
 
 if __name__ == "__main__":
