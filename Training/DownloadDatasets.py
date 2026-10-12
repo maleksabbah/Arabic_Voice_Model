@@ -250,7 +250,7 @@ def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=N
         if rec_id not in loaded_recordings:
             wav_path = wav_paths[rec_id]
             try:
-                audio, sr = sf.read(wav_path)
+                audio, sr = sf.read(wav_path, dtype="float32")
                 if sr != SAMPLE_RATE:
                     import torchaudio
                     import torch
@@ -292,8 +292,8 @@ def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=N
         if (i + 1) % 5000 == 0:
             print(f"    Processed {i+1}/{len(segments)} segments...")
 
-        # Free memory for large recordings
-        if len(loaded_recordings) > 50:
+        # Segments come grouped by recording, so a tiny cache suffices; the pod is capped at 8 GB RAM
+        if len(loaded_recordings) > 2:
             oldest = list(loaded_recordings.keys())[0]
             del loaded_recordings[oldest]
 
