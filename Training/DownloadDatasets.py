@@ -236,7 +236,8 @@ def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=N
             skipped += 1
             continue
 
-        out_file = os.path.join(output_path, f"{utt_id}.wav")
+        # Test utt ids contain ':', which the RunPod network volume rejects in filenames
+        out_file = os.path.join(output_path, f"{utt_id.replace(':', '-')}.wav")
         normalized = normalize_arabic(transcript)
 
         # Resume: segment already written by an earlier run
