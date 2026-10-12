@@ -9,7 +9,7 @@ This is a diagnostic: how much Arabic dialect knowledge is
 already in the pretrained representations?
 
 Usage:
-    python train_probe.py \
+    python Training/TrainProbe.py \
         --train_data /workspace/datasets/train_combined \
         --eval_casablanca /workspace/datasets/eval_casablanca_test \
         --eval_mgb2 /workspace/datasets/eval_mgb2_test \
@@ -109,13 +109,14 @@ class Wav2VecBertCTCProbe(nn.Module):
 
     def _get_output_lengths(self, attention_mask):
         """Compute output sequence lengths after encoder downsampling."""
-        # w2v-BERT 2.0 uses an adapter that downsamples
-        # The exact ratio depends on the model config
-        # For facebook/w2v-bert-2.0, the adapter stride is typically 2
+        # facebook/w2v-bert-2.0 ships with add_adapter=False, so the encoder
+        # keeps one output frame per input_features frame (the feature
+        # extractor already did the 2x stacking). Only the adapter downsamples.
         input_lengths = attention_mask.sum(dim=-1)
-        # The adapter in w2v-BERT 2.0 halves the sequence length
-        output_lengths = input_lengths // 2
-        return output_lengths.long()
+        if self.encoder.config.add_adapter:
+            for _ in range(self.encoder.config.num_adapter_layers):
+                input_lengths = (input_lengths + 2 * (self.encoder.config.adapter_stride // 2) - self.encoder.config.adapter_kernel_size) // self.encoder.config.adapter_stride + 1
+        return input_lengths.long()
 
 
 # ============================================================
