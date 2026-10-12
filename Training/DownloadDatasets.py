@@ -16,6 +16,7 @@ import soundfile as sf
 import numpy as np
 import json
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from huggingface_hub import login, hf_hub_download
 from datasets import load_dataset, Audio, concatenate_datasets, Dataset, DatasetDict
@@ -74,9 +75,9 @@ def download_mgb2_split(split_name):
     extract_dir = os.path.join(OUTPUT_DIR, "mgb2_raw")
     split_dir = os.path.join(extract_dir, split_name)
 
-    # Check if already extracted
-    segments_file = os.path.join(split_dir, "segments.non_overlap_speech") if split_name == "test" else os.path.join(split_dir, "segments")
-    if os.path.exists(segments_file):
+    # Check if already extracted (train ships XML alignments, not Kaldi segments)
+    marker = os.path.join(split_dir, "segments.non_overlap_speech") if split_name == "test" else os.path.join(split_dir, "xml", "utf8")
+    if os.path.exists(marker):
         print(f"  MGB-2 {split_name} already extracted at {split_dir}")
         return split_dir
 
@@ -158,6 +159,41 @@ def load_mgb2_segments(mgb2_dir, split_type="test"):
     return segments
 
 
+# Same cut as the Kaldi MGB-2 recipe's train_mer80: drops only badly aligned segments
+MGB2_MAX_WMER = 80.0
+
+def load_mgb2_xml_segments(mgb2_dir, max_wmer=MGB2_MAX_WMER):
+    """
+    Load MGB-2 train segments from the aligned XML transcripts (xml/utf8/*.xml).
+    Returns list of (utt_id, recording_id, start_s, end_s, transcript).
+    """
+    xml_dir = os.path.join(mgb2_dir, "xml", "utf8")
+    if not os.path.isdir(xml_dir):
+        print(f"  Missing {xml_dir}")
+        return []
+
+    segments = []
+    dropped = 0
+    for xml_file in sorted(Path(xml_dir).glob("*.xml")):
+        rec_id = xml_file.stem
+        root = ET.parse(xml_file).getroot()
+        for seg in root.iter("segment"):
+            if float(seg.get("WMER", 0)) > max_wmer:
+                dropped += 1
+                continue
+            words = [el.text for el in seg.iter("element") if el.text]
+            if not words:
+                continue
+            segments.append((
+                seg.get("id"), rec_id,
+                float(seg.get("starttime")), float(seg.get("endtime")),
+                " ".join(words),
+            ))
+
+    print(f"  Loaded {len(segments)} segments from {xml_dir} (dropped {dropped} with WMER > {max_wmer})")
+    return segments
+
+
 def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=None):
     """
     Extract audio segments from MGB-2 wav files and save as individual files.
@@ -175,7 +211,8 @@ def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=N
             for line in f:
                 parts = line.strip().split(None, 1)
                 if len(parts) == 2:
-                    wav_paths[parts[0]] = parts[1]
+                    # wav.scp paths are relative to the split dir, not the cwd
+                    wav_paths[parts[0]] = os.path.join(mgb2_dir, parts[1])
     else:
         # Look for wav files directly
         for f in Path(mgb2_dir).rglob("*.wav"):
@@ -197,6 +234,15 @@ def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=N
     for i, (utt_id, rec_id, start, end, transcript) in enumerate(segments):
         if rec_id not in wav_paths:
             skipped += 1
+            continue
+
+        out_file = os.path.join(output_path, f"{utt_id}.wav")
+        normalized = normalize_arabic(transcript)
+
+        # Resume: segment already written by an earlier run
+        if os.path.exists(out_file) and end - start >= 0.1:
+            if normalized:
+                manifest.append({"audio_path": out_file, "text": normalized, "utt_id": utt_id, "duration": end - start})
             continue
 
         # Load recording (cache it)
@@ -232,10 +278,8 @@ def mgb2_segments_to_audio_files(mgb2_dir, segments, output_path, max_segments=N
             continue
 
         # Save segment
-        out_file = os.path.join(output_path, f"{utt_id}.wav")
         sf.write(out_file, segment_audio, sr)
 
-        normalized = normalize_arabic(transcript)
         if normalized:
             manifest.append({
                 "audio_path": out_file,
@@ -409,7 +453,7 @@ def main():
     # Train split
     mgb2_train_dir = download_mgb2_split("train")
     if mgb2_train_dir:
-        segments = load_mgb2_segments(mgb2_train_dir, split_type="train")
+        segments = load_mgb2_xml_segments(mgb2_train_dir)
         if segments:
             train_audio_dir = os.path.join(OUTPUT_DIR, "mgb2_train_audio")
             manifest = mgb2_segments_to_audio_files(
@@ -489,7 +533,8 @@ def main():
             if remove_cols:
                 ds = ds.remove_columns(remove_cols)
 
-            ds = ds.map(lambda x, n=name: {"source": n})
+            # add_column, not map: map would decode every row's audio just to tag it
+            ds = ds.add_column("source", [name] * len(ds))
             print(f"  {name}: {len(ds)} samples")
             standardized.append(ds)
 
