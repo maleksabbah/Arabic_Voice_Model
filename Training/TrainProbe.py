@@ -125,8 +125,8 @@ class Wav2VecBertCTCProbe(nn.Module):
 def build_vocab(dataset, text_col="normalized_text"):
     """Build character vocabulary from training data."""
     chars = set()
-    for item in dataset:
-        text = item.get(text_col, "")
+    # Read only the text column; iterating rows would decode every audio clip
+    for text in dataset[text_col]:
         if text:
             chars.update(text)
 
