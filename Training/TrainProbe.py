@@ -1,6 +1,7 @@
 """
-w2v-BERT 2.0 Frozen Encoder Probe — Manual Training Loop
-Trains only a CTC linear head on frozen encoder representations.
+w2v-BERT 2.0 Frozen Encoder Probe v3 — Weighted Layer Sum
+Learns a weighted combination of ALL encoder layers, not just the last one.
+CTC linear head on frozen encoder representations.
 """
 
 import os, argparse, json, re, time, random
@@ -18,7 +19,7 @@ import evaluate
 # UTILS
 # ============================================================
 
-ARABIC_DIACRITICS = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]')
+ARABIC_DIACRITICS = re.compile(r'[ؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۤۧۨ-ۭ]')
 
 def normalize_arabic(text):
     if not text or not isinstance(text, str):
@@ -26,7 +27,7 @@ def normalize_arabic(text):
     text = ARABIC_DIACRITICS.sub('', text)
     text = re.sub(r'[إأآا]', 'ا', text)
     text = text.replace('ة', 'ه').replace('ى', 'ي').replace('ـ', '')
-    text = re.sub(r'[^\u0621-\u064A\u0660-\u0669\s]', '', text)
+    text = re.sub(r'[^ء-ي٠-٩\s]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -140,6 +141,7 @@ class Wav2VecBertCTCProbe(nn.Module):
         super().__init__()
         self.encoder = Wav2Vec2BertModel.from_pretrained(model_name)
         hidden_size = self.encoder.config.hidden_size
+        num_layers = self.encoder.config.num_hidden_layers  # 24 for w2v-BERT 2.0
 
         for param in self.encoder.parameters():
             param.requires_grad = False
@@ -148,12 +150,17 @@ class Wav2VecBertCTCProbe(nn.Module):
         self.encoder.eval()
         self.encoder.config.apply_spec_augment = False
 
+        # Learnable layer weights — one scalar per encoder layer
+        # Initialized to zero so softmax gives uniform 1/num_layers
+        self.layer_weights = nn.Parameter(torch.zeros(num_layers))
+
         self.lm_head = nn.Linear(hidden_size, vocab_size)
         self.ctc_loss = nn.CTCLoss(blank=pad_token_id, reduction="mean", zero_infinity=True)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
         print(f"  Params: {total:,} total, {trainable:,} trainable ({100*trainable/total:.4f}%)")
+        print(f"  Layer weights: {num_layers} layers")
 
     def train(self, mode=True):
         # Override train() so encoder ALWAYS stays in eval mode
@@ -161,11 +168,31 @@ class Wav2VecBertCTCProbe(nn.Module):
         self.encoder.eval()
         return self
 
+    def get_layer_weight_distribution(self):
+        """Return the softmax-normalized layer weights for inspection."""
+        return torch.softmax(self.layer_weights, dim=0).detach().cpu().numpy()
+
     def forward(self, input_features, attention_mask=None, labels=None):
         with torch.no_grad():
-            outputs = self.encoder(input_features=input_features, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
+            outputs = self.encoder(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                output_hidden_states=True,  # return all layer outputs
+            )
+
+        # outputs.hidden_states is a tuple of (num_layers + 1) tensors
+        # Index 0 is the embedding layer output, 1..24 are the transformer layers
+        # We skip index 0 (raw embedding) and use only transformer layer outputs
+        hidden_states = torch.stack(outputs.hidden_states[1:], dim=0)  # (num_layers, batch, frames, 1024)
+
+        # Weighted sum across layers
+        weights = torch.softmax(self.layer_weights, dim=0)  # (num_layers,)
+        # Reshape for broadcasting: (num_layers, 1, 1, 1)
+        weights = weights.view(-1, 1, 1, 1)
+        # Weighted sum: (batch, frames, 1024)
+        blended = (weights * hidden_states).sum(dim=0)
+
+        logits = self.lm_head(blended)
 
         loss = None
         if labels is not None:
@@ -192,7 +219,9 @@ class Wav2VecBertCTCProbe(nn.Module):
 # ============================================================
 
 def train(model, train_loader, eval_fn, args, device):
-    optimizer = torch.optim.AdamW(model.lm_head.parameters(), lr=args.lr, weight_decay=0.01)
+    # Optimize BOTH lm_head AND layer_weights
+    trainable_params = list(model.lm_head.parameters()) + [model.layer_weights]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda") if device == "cuda" else None
 
     # Warmup + cosine decay schedule
@@ -237,12 +266,12 @@ def train(model, train_loader, eval_fn, args, device):
             if scaler:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.lm_head.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.lm_head.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
 
             scheduler.step()
@@ -257,11 +286,21 @@ def train(model, train_loader, eval_fn, args, device):
                 lr = scheduler.get_last_lr()[0]
                 bar.set_postfix({"loss": f"{loss_val:.3f}", "avg": f"{avg_loss:.3f}", "lr": f"{lr:.1e}", "step": global_step})
 
+            # PRINT LAYER WEIGHTS periodically
+            if global_step % (args.save_every // 2) == 0:
+                w = model.get_layer_weight_distribution()
+                top_3 = np.argsort(w)[-3:][::-1]
+                top_str = ", ".join([f"L{i+1}={w[i]:.3f}" for i in top_3])
+                print(f"  Layer weights (step {global_step}): top 3 = {top_str}")
+
             # SAVE + MID-TRAINING EVAL
             if global_step % args.save_every == 0:
                 save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                 os.makedirs(save_dir, exist_ok=True)
-                torch.save(model.lm_head.state_dict(), os.path.join(save_dir, "ctc_head.pt"))
+                torch.save({
+                    "lm_head": model.lm_head.state_dict(),
+                    "layer_weights": model.layer_weights.data,
+                }, os.path.join(save_dir, "probe_head.pt"))
 
                 # Quick eval to track progress
                 if eval_fn:
@@ -270,7 +309,10 @@ def train(model, train_loader, eval_fn, args, device):
                         best_wer = mid_wer
                         best_dir = os.path.join(args.output_dir, "best")
                         os.makedirs(best_dir, exist_ok=True)
-                        torch.save(model.lm_head.state_dict(), os.path.join(best_dir, "ctc_head.pt"))
+                        torch.save({
+                            "lm_head": model.lm_head.state_dict(),
+                            "layer_weights": model.layer_weights.data,
+                        }, os.path.join(best_dir, "probe_head.pt"))
                         print(f"  *** New best WER: {best_wer*100:.1f}% ***")
 
             # STOP
@@ -282,7 +324,21 @@ def train(model, train_loader, eval_fn, args, device):
         if global_step >= args.max_steps:
             break
 
-    torch.save(model.lm_head.state_dict(), os.path.join(args.output_dir, "ctc_head.pt"))
+    # Save final
+    torch.save({
+        "lm_head": model.lm_head.state_dict(),
+        "layer_weights": model.layer_weights.data,
+    }, os.path.join(args.output_dir, "probe_head.pt"))
+
+    # Print final layer weight distribution
+    w = model.get_layer_weight_distribution()
+    print(f"\n  Final layer weights:")
+    for i, wi in enumerate(w):
+        bar_str = "█" * int(wi * 100)
+        print(f"    Layer {i+1:2d}: {wi:.4f} {bar_str}")
+    top_3 = np.argsort(w)[-3:][::-1]
+    print(f"  Top layers: {', '.join([f'L{i+1} ({w[i]:.3f})' for i in top_3])}")
+
     elapsed = time.time() - start_time
     print(f"  Training done: {global_step} steps, {elapsed/60:.1f} min, best WER: {best_wer*100:.1f}%")
     return global_step, best_wer
@@ -380,7 +436,7 @@ def main():
     parser.add_argument("--eval_casablanca", default="/workspace/datasets/eval_casablanca_test")
     parser.add_argument("--eval_mgb2", default="/workspace/datasets/eval_mgb2_test")
     parser.add_argument("--eval_fleurs", default="/workspace/datasets/eval_fleurs")
-    parser.add_argument("--output_dir", default="/workspace/probe_output")
+    parser.add_argument("--output_dir", default="/workspace/probe_output_v3")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -429,7 +485,9 @@ def main():
 
     if args.checkpoint:
         print(f"  Loading checkpoint: {args.checkpoint}")
-        model.lm_head.load_state_dict(torch.load(os.path.join(args.checkpoint, "ctc_head.pt"), map_location=device))
+        ckpt = torch.load(os.path.join(args.checkpoint, "probe_head.pt"), map_location=device)
+        model.lm_head.load_state_dict(ckpt["lm_head"])
+        model.layer_weights.data = ckpt["layer_weights"].to(device)
 
     # ---- 3. TRAIN ----
     if not args.eval_only:
@@ -467,6 +525,10 @@ def main():
         ds = filter_dataset(ds)
         results["fleurs"] = evaluate_dataset(model, feature_extractor, ds, vocab, args.batch_size, "FLEURS", device)
 
+    # Save layer weights to results
+    w = model.get_layer_weight_distribution()
+    results["layer_weights"] = {f"layer_{i+1}": float(wi) for i, wi in enumerate(w)}
+
     # ---- 5. SAVE ----
     with open(os.path.join(args.output_dir, "probe_results.json"), "w") as f:
         json.dump(results, f, indent=2)
@@ -475,6 +537,8 @@ def main():
     print("FINAL RESULTS")
     print("="*60)
     for name, r in results.items():
+        if name == "layer_weights":
+            continue
         if isinstance(r, dict) and "wer" in r:
             print(f"  {name}: {r['wer']*100:.1f}% WER")
         elif isinstance(r, dict):
@@ -486,8 +550,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-    
