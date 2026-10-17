@@ -3,7 +3,7 @@ w2v-BERT 2.0 Frozen Encoder Probe — Manual Training Loop
 Trains only a CTC linear head on frozen encoder representations.
 """
 
-import os, argparse, json, re, time
+import os, argparse, json, re, time, random
 import numpy as np
 import torch
 from torch import nn
@@ -18,7 +18,7 @@ import evaluate
 # UTILS
 # ============================================================
 
-ARABIC_DIACRITICS = re.compile(r'[ؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۤۧۨ-ۭ]')
+ARABIC_DIACRITICS = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]')
 
 def normalize_arabic(text):
     if not text or not isinstance(text, str):
@@ -26,7 +26,7 @@ def normalize_arabic(text):
     text = ARABIC_DIACRITICS.sub('', text)
     text = re.sub(r'[إأآا]', 'ا', text)
     text = text.replace('ة', 'ه').replace('ى', 'ي').replace('ـ', '')
-    text = re.sub(r'[^ء-ي٠-٩\s]', '', text)
+    text = re.sub(r'[^\u0621-\u064A\u0660-\u0669\s]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -41,6 +41,14 @@ def text_to_labels(text, vocab):
         else:
             labels.append(vocab.get("<unk>", 0))
     return labels
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # ============================================================
@@ -136,12 +144,22 @@ class Wav2VecBertCTCProbe(nn.Module):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
+        # Force encoder into eval mode permanently — no dropout, no SpecAugment
+        self.encoder.eval()
+        self.encoder.config.apply_spec_augment = False
+
         self.lm_head = nn.Linear(hidden_size, vocab_size)
         self.ctc_loss = nn.CTCLoss(blank=pad_token_id, reduction="mean", zero_infinity=True)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
         print(f"  Params: {total:,} total, {trainable:,} trainable ({100*trainable/total:.4f}%)")
+
+    def train(self, mode=True):
+        # Override train() so encoder ALWAYS stays in eval mode
+        super().train(mode)
+        self.encoder.eval()
+        return self
 
     def forward(self, input_features, attention_mask=None, labels=None):
         with torch.no_grad():
@@ -173,16 +191,28 @@ class Wav2VecBertCTCProbe(nn.Module):
 # TRAIN
 # ============================================================
 
-def train(model, train_loader, args, device):
+def train(model, train_loader, eval_fn, args, device):
     optimizer = torch.optim.AdamW(model.lm_head.parameters(), lr=args.lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda") if device == "cuda" else None
 
+    # Warmup + cosine decay schedule
+    total_steps = min(args.max_steps, len(train_loader) * args.epochs)
+    warmup_steps = min(500, total_steps // 10)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(0.1, 0.5 * (1 + np.cos(np.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     global_step = 0
-    best_loss = float("inf")
+    best_wer = float("inf")
     start_time = time.time()
 
     for epoch in range(args.epochs):
-        model.train()
+        model.train()  # encoder stays in eval via override
         epoch_losses = []
         bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
 
@@ -215,6 +245,8 @@ def train(model, train_loader, args, device):
                 torch.nn.utils.clip_grad_norm_(model.lm_head.parameters(), 1.0)
                 optimizer.step()
 
+            scheduler.step()
+
             loss_val = loss.item()
             epoch_losses.append(loss_val)
             global_step += 1
@@ -222,20 +254,24 @@ def train(model, train_loader, args, device):
             # LOG
             if global_step % args.log_every == 0:
                 avg_loss = np.mean(epoch_losses[-100:])
-                bar.set_postfix({"loss": f"{loss_val:.3f}", "avg": f"{avg_loss:.3f}", "step": global_step})
+                lr = scheduler.get_last_lr()[0]
+                bar.set_postfix({"loss": f"{loss_val:.3f}", "avg": f"{avg_loss:.3f}", "lr": f"{lr:.1e}", "step": global_step})
 
-            # SAVE
+            # SAVE + MID-TRAINING EVAL
             if global_step % args.save_every == 0:
-                avg_loss = np.mean(epoch_losses[-100:])
                 save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                 os.makedirs(save_dir, exist_ok=True)
                 torch.save(model.lm_head.state_dict(), os.path.join(save_dir, "ctc_head.pt"))
 
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    best_dir = os.path.join(args.output_dir, "best")
-                    os.makedirs(best_dir, exist_ok=True)
-                    torch.save(model.lm_head.state_dict(), os.path.join(best_dir, "ctc_head.pt"))
+                # Quick eval to track progress
+                if eval_fn:
+                    mid_wer = eval_fn()
+                    if mid_wer < best_wer:
+                        best_wer = mid_wer
+                        best_dir = os.path.join(args.output_dir, "best")
+                        os.makedirs(best_dir, exist_ok=True)
+                        torch.save(model.lm_head.state_dict(), os.path.join(best_dir, "ctc_head.pt"))
+                        print(f"  *** New best WER: {best_wer*100:.1f}% ***")
 
             # STOP
             if global_step >= args.max_steps:
@@ -248,8 +284,8 @@ def train(model, train_loader, args, device):
 
     torch.save(model.lm_head.state_dict(), os.path.join(args.output_dir, "ctc_head.pt"))
     elapsed = time.time() - start_time
-    print(f"  Training done: {global_step} steps, {elapsed/60:.1f} min")
-    return global_step, best_loss
+    print(f"  Training done: {global_step} steps, {elapsed/60:.1f} min, best WER: {best_wer*100:.1f}%")
+    return global_step, best_wer
 
 
 # ============================================================
@@ -274,8 +310,8 @@ def ctc_decode(ids, id_to_char):
     return "".join(decoded).strip()
 
 
-def evaluate_dataset(model, feature_extractor, dataset, vocab, batch_size=8, name="eval", device="cuda"):
-    model.eval()
+def evaluate_dataset(model, feature_extractor, dataset, vocab, batch_size=8, name="eval", device="cuda", print_samples=3):
+    model.eval()  # encoder stays in eval via override
     wer_metric = evaluate.load("wer")
     id_to_char = {v: k for k, v in vocab.items()}
     collator = CTCDataCollator(feature_extractor=feature_extractor, vocab=vocab)
@@ -303,7 +339,17 @@ def evaluate_dataset(model, feature_extractor, dataset, vocab, batch_size=8, nam
 
     wer_score = wer_metric.compute(predictions=all_preds, references=all_refs) if all_refs else 1.0
     print(f"  {name}: WER={wer_score*100:.1f}% ({len(all_refs)} samples)")
-    model.train()
+
+    # Print sample predictions so we can see what's actually happening
+    if print_samples > 0 and all_refs:
+        print(f"  Sample predictions ({name}):")
+        indices = list(range(len(all_refs)))
+        random.shuffle(indices)
+        for i in indices[:print_samples]:
+            print(f"    REF: {all_refs[i][:80]}")
+            print(f"    PRD: {all_preds[i][:80]}")
+            print()
+
     return {"wer": wer_score, "samples": len(all_refs)}
 
 
@@ -314,7 +360,7 @@ def evaluate_casablanca(model, feature_extractor, dataset, vocab, batch_size=8, 
     results = {}
     for dialect in sorted(set(dataset["dialect"])):
         subset = dataset.filter(lambda x: x["dialect"] == dialect)
-        r = evaluate_dataset(model, feature_extractor, subset, vocab, batch_size, f"Casablanca/{dialect}", device)
+        r = evaluate_dataset(model, feature_extractor, subset, vocab, batch_size, f"Casablanca/{dialect}", device, print_samples=1)
         results[dialect] = r["wer"]
 
     avg = np.mean(list(results.values()))
@@ -338,13 +384,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--max_steps", type=int, default=30000)
+    parser.add_argument("--max_steps", type=int, default=50000)
     parser.add_argument("--save_every", type=int, default=5000)
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--checkpoint", default=None)
     args = parser.parse_args()
 
+    set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -373,7 +420,7 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collator, num_workers=4, pin_memory=True,
+        collate_fn=collator, num_workers=2, pin_memory=True,
     )
 
     # ---- 2. MODEL ----
@@ -386,12 +433,19 @@ def main():
 
     # ---- 3. TRAIN ----
     if not args.eval_only:
-        train(model, train_loader, args, device)
+        # Create a quick eval function for mid-training checks using FLEURS (small, fast)
+        eval_fn = None
+        if os.path.exists(args.eval_fleurs):
+            fleurs_ds = load_from_disk(args.eval_fleurs).cast_column("audio", Audio(sampling_rate=16000))
+            fleurs_ds = filter_dataset(fleurs_ds)
+            def quick_eval():
+                r = evaluate_dataset(model, feature_extractor, fleurs_ds, vocab, args.batch_size, "FLEURS (mid-train)", device, print_samples=2)
+                return r["wer"]
+            eval_fn = quick_eval
+
+        train(model, train_loader, eval_fn, args, device)
 
     # ---- 4. EVAL ----
-    print("\n" + "="*60)
-    print("EVALUATION")
-    print("="*60)
     print("\n" + "="*60)
     print("EVALUATION")
     print("="*60)
@@ -418,6 +472,8 @@ def main():
         json.dump(results, f, indent=2)
 
     print("\n" + "="*60)
+    print("FINAL RESULTS")
+    print("="*60)
     for name, r in results.items():
         if isinstance(r, dict) and "wer" in r:
             print(f"  {name}: {r['wer']*100:.1f}% WER")
@@ -430,3 +486,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+    
