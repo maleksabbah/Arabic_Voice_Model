@@ -186,7 +186,7 @@ class ArabEstCTCProbe(nn.Module):
     model size (300M, 600M, etc.) without code changes.
     """
 
-    def __init__(self, model_dir, yaml_config, vocab_size, pad_token_id=0, device="cpu"):
+    def __init__(self, model_dir, yaml_config, vocab_size, pad_token_id=0, device="cpu", probe_layers=None):
         super().__init__()
 
         # ---- Load YAML config — builds all model objects automatically ----
@@ -249,17 +249,27 @@ class ArabEstCTCProbe(nn.Module):
         self.wrapper.eval()
 
         # ---- Probe head — dimensions read from the config, not hardcoded ----
-        num_layers = hparams["num_encoder_layers"]
+        total_layers = hparams["num_encoder_layers"]
         hidden_size = hparams["d_model"]
 
-        self.layer_weights = nn.Parameter(torch.zeros(num_layers))
+        # probe_layers: which encoder layers to use (1-indexed, inclusive)
+        # None = all layers (original behavior)
+        self.probe_layers = probe_layers  # e.g. [17, 18, 19]
+        if self.probe_layers is not None:
+            num_weights = len(self.probe_layers)
+            print(f"  Probing layers: {self.probe_layers} ({num_weights} layers)")
+        else:
+            num_weights = total_layers
+            print(f"  Probing ALL {num_weights} layers")
+
+        self.layer_weights = nn.Parameter(torch.zeros(num_weights))
         self.lm_head = nn.Linear(hidden_size, vocab_size)
         self.ctc_loss = nn.CTCLoss(blank=pad_token_id, reduction="mean", zero_infinity=True)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
         print(f"  Params: {total:,} total, {trainable:,} trainable ({100 * trainable / total:.4f}%)")
-        print(f"  Layer weights: {num_layers} layers, d_model={hidden_size}")
+        print(f"  Layer weights: {num_weights} layers, d_model={hidden_size}")
 
     def train(self, mode=True):
         """Override: encoder/CNN/normalizer always stay in eval mode."""
@@ -271,7 +281,11 @@ class ArabEstCTCProbe(nn.Module):
 
     def get_layer_weight_distribution(self):
         """Return softmax-normalized layer weights for inspection."""
-        return torch.softmax(self.layer_weights, dim=0).detach().cpu().numpy()
+        weights = torch.softmax(self.layer_weights, dim=0).detach().cpu().numpy()
+        if self.probe_layers is not None:
+            # Return dict mapping actual layer numbers to weights
+            return {f"L{i}": float(w) for i, w in zip(self.probe_layers, weights)}
+        return weights
 
     def forward(self, audio, audio_lengths, labels=None):
         """
@@ -301,7 +315,11 @@ class ArabEstCTCProbe(nn.Module):
 
             # hidden_states has 25 elements: [input_embedding] + [24 layer outputs]
             # Skip index 0 (input projection), use 1..24 (conformer layer outputs)
-            layer_outputs = torch.stack(hidden_states[1:], dim=0)  # (24, B, T', 1024)
+            if self.probe_layers is not None:
+                # Select only specified layers (1-indexed → hidden_states index)
+                layer_outputs = torch.stack([hidden_states[i] for i in self.probe_layers], dim=0)
+            else:
+                layer_outputs = torch.stack(hidden_states[1:], dim=0)  # (24, B, T', d_model)
 
         # 6. Weighted sum across layers (learnable, softmax-normalized)
         weights = torch.softmax(self.layer_weights, dim=0)  # (24,)
@@ -409,9 +427,13 @@ def train(model, train_loader, eval_fn, args, device):
             # Print layer weights periodically
             if global_step % (args.save_every // 2) == 0:
                 w = model.get_layer_weight_distribution()
-                top_3 = np.argsort(w)[-3:][::-1]
-                top_str = ", ".join([f"L{i + 1}={w[i]:.3f}" for i in top_3])
-                print(f"  Layer weights (step {global_step}): top 3 = {top_str}")
+                if isinstance(w, dict):
+                    sorted_w = sorted(w.items(), key=lambda x: x[1], reverse=True)
+                    top_str = ", ".join([f"{k}={v:.3f}" for k, v in sorted_w[:3]])
+                else:
+                    top_3 = np.argsort(w)[-3:][::-1]
+                    top_str = ", ".join([f"L{i + 1}={w[i]:.3f}" for i in top_3])
+                print(f"  Layer weights (step {global_step}): top = {top_str}")
 
             # Save + mid-training eval
             if global_step % args.save_every == 0:
@@ -450,11 +472,18 @@ def train(model, train_loader, eval_fn, args, device):
     # Print final layer weight distribution
     w = model.get_layer_weight_distribution()
     print(f"\n  Final layer weights:")
-    for i, wi in enumerate(w):
-        bar_str = "█" * int(wi * 100)
-        print(f"    Layer {i + 1:2d}: {wi:.4f} {bar_str}")
-    top_3 = np.argsort(w)[-3:][::-1]
-    print(f"  Top layers: {', '.join([f'L{i + 1} ({w[i]:.3f})' for i in top_3])}")
+    if isinstance(w, dict):
+        for name, wi in w.items():
+            bar_str = "█" * int(wi * 100)
+            print(f"    {name}: {wi:.4f} {bar_str}")
+        sorted_w = sorted(w.items(), key=lambda x: x[1], reverse=True)
+        print(f"  Top layers: {', '.join([f'{k} ({v:.3f})' for k, v in sorted_w[:3]])}")
+    else:
+        for i, wi in enumerate(w):
+            bar_str = "█" * int(wi * 100)
+            print(f"    Layer {i + 1:2d}: {wi:.4f} {bar_str}")
+        top_3 = np.argsort(w)[-3:][::-1]
+        print(f"  Top layers: {', '.join([f'L{i + 1} ({w[i]:.3f})' for i in top_3])}")
 
     elapsed = time.time() - start_time
     print(f"  Training done: {global_step} steps, {elapsed / 60:.1f} min, best WER: {best_wer * 100:.1f}%")
@@ -567,6 +596,8 @@ def main():
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--checkpoint", default=None,
                         help="Path to probe checkpoint dir to resume from")
+    parser.add_argument("--probe_layers", default=None,
+                        help="Comma-separated 1-indexed layer numbers to probe (e.g. '17,18,19'). Default: all layers")
     args = parser.parse_args()
 
     global NUM_WORKERS
@@ -606,9 +637,12 @@ def main():
 
     # ---- 2. MODEL ----
     print("Loading AraBEST-RQ encoder...")
+    probe_layers = None
+    if args.probe_layers:
+        probe_layers = [int(x.strip()) for x in args.probe_layers.split(",")]
     model = ArabEstCTCProbe(
         model_dir=args.model_dir, yaml_config=args.yaml_config,
-        vocab_size=len(vocab), device=device,
+        vocab_size=len(vocab), device=device, probe_layers=probe_layers,
     ).to(device)
 
     if args.checkpoint:
@@ -657,7 +691,10 @@ def main():
 
     # Save layer weights
     w = model.get_layer_weight_distribution()
-    results["layer_weights"] = {f"layer_{i + 1}": float(wi) for i, wi in enumerate(w)}
+    if isinstance(w, dict):
+        results["layer_weights"] = w
+    else:
+        results["layer_weights"] = {f"layer_{i + 1}": float(wi) for i, wi in enumerate(w)}
 
     # ---- 5. SAVE ----
     with open(os.path.join(args.output_dir, "probe_results.json"), "w") as f:
