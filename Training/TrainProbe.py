@@ -58,6 +58,9 @@ def text_to_labels(text, vocab):
     return labels
 
 
+NUM_WORKERS = 8  # eval DataLoader workers; main() sets this from --num_workers
+
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -88,7 +91,7 @@ def build_vocab(dataset, text_col="normalized_text"):
     return vocab
 
 
-def filter_dataset(dataset, min_seconds=0.5, max_seconds=30.0):
+def filter_dataset(dataset, min_seconds=0.5, max_seconds=30.0, num_proc=None):
     """Filter out invalid samples.
 
     AraBEST-RQ uses Fbank (hop=10ms) + CNN (stride 2x2 = 4x downsample).
@@ -115,7 +118,7 @@ def filter_dataset(dataset, min_seconds=0.5, max_seconds=30.0):
         return True
 
     before = len(dataset)
-    dataset = dataset.filter(is_valid)
+    dataset = dataset.filter(is_valid, num_proc=num_proc)
     after = len(dataset)
     removed = before - after
     if removed > 0:
@@ -486,7 +489,8 @@ def evaluate_dataset(model, dataset, vocab, batch_size=8, name="eval", device="c
     id_to_char = {v: k for k, v in vocab.items()}
 
     probe_ds = ArabEstProbeDataset(dataset, vocab)
-    loader = DataLoader(probe_ds, batch_size=batch_size, collate_fn=collate_fn, num_workers=0)
+    loader = DataLoader(probe_ds, batch_size=batch_size, collate_fn=collate_fn,
+                        num_workers=NUM_WORKERS, pin_memory=True)
 
     all_preds, all_refs = [], []
 
@@ -558,10 +562,15 @@ def main():
     parser.add_argument("--max_steps", type=int, default=50000)
     parser.add_argument("--save_every", type=int, default=5000)
     parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--num_workers", type=int, default=min(32, os.cpu_count() or 1),
+                        help="DataLoader workers; audio decoding is the bottleneck")
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--checkpoint", default=None,
                         help="Path to probe checkpoint dir to resume from")
     args = parser.parse_args()
+
+    global NUM_WORKERS
+    NUM_WORKERS = args.num_workers
 
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -574,7 +583,7 @@ def main():
     print(f"  Raw: {len(train_dataset)} samples")
 
     print("Filtering...")
-    train_dataset = filter_dataset(train_dataset)
+    train_dataset = filter_dataset(train_dataset, num_proc=args.num_workers)
 
     print("Building vocab...")
     vocab_path = os.path.join(args.output_dir, "vocab.json")
@@ -591,7 +600,8 @@ def main():
     probe_train = ArabEstProbeDataset(train_dataset, vocab)
     train_loader = DataLoader(
         probe_train, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=2, pin_memory=True,
+        collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=True, prefetch_factor=4,
     )
 
     # ---- 2. MODEL ----
