@@ -1,17 +1,18 @@
 """
-AraBEST-RQ 600M Frozen Encoder Probe — Weighted Layer Sum
-Learns a weighted combination of ALL 24 conformer layers from
-AraBEST-RQ-600M-14k (SpeechBrain BEST-RQ, 14K hrs multi-dialectal Arabic).
-CTC linear head on frozen encoder representations.
+AraBEST-RQ Frozen Encoder Probe — Weighted Layer Sum
+Learns a weighted combination of ALL conformer layers from any AraBEST-RQ
+checkpoint (300M, 600M, etc.). Architecture is inferred from the checkpoint
+and YAML config — no hardcoded dimensions.
 
 Usage:
   # First download the model on your pod:
-  pip install speechbrain huggingface_hub
-  python -c "from huggingface_hub import snapshot_download; snapshot_download('Elyadata/AraBEST-RQ-600M-14k', local_dir='/workspace/arabest_model')"
+  pip install speechbrain huggingface_hub hyperpyyaml
+  python -c "from huggingface_hub import snapshot_download; snapshot_download('Elyadata/AraBEST-RQ-300M-6k', local_dir='/workspace/arabest_model')"
 
-  # Then run:
+  # Then run (point --yaml_config at the matching YAML):
   python train_probe_arabest.py \
     --model_dir /workspace/arabest_model \
+    --yaml_config /workspace/AraBEST-RQ/model/hparams/hybrid_300M.yaml \
     --train_data /workspace/datasets/train_combined \
     --output_dir /workspace/probe_output_arabest
 """
@@ -24,15 +25,7 @@ from torch.utils.data import DataLoader, Dataset
 from datasets import load_from_disk, Audio
 from tqdm import tqdm
 import evaluate
-
-# SpeechBrain imports
-from speechbrain.lobes.features import Fbank
-from speechbrain.processing.features import InputNormalization
-from speechbrain.lobes.models.convolution import ConvolutionFrontEnd
-from speechbrain.lobes.models.transformer.TransformerASR import (
-    TransformerASR,
-    EncoderWrapper,
-)
+from hyperpyyaml import load_hyperpyyaml
 
 
 # ============================================================
@@ -184,70 +177,45 @@ def collate_fn(batch):
 # ============================================================
 
 class ArabEstCTCProbe(nn.Module):
-    """Frozen AraBEST-RQ encoder with learnable weighted-layer-sum + CTC head."""
+    """Frozen AraBEST-RQ encoder with learnable weighted-layer-sum + CTC head.
 
-    def __init__(self, model_dir, vocab_size, pad_token_id=0, device="cpu"):
+    Architecture is built from the YAML config — works with any AraBEST-RQ
+    model size (300M, 600M, etc.) without code changes.
+    """
+
+    def __init__(self, model_dir, yaml_config, vocab_size, pad_token_id=0, device="cpu"):
         super().__init__()
 
-        # ---- Build the encoder from AraBEST-RQ's architecture ----
-        # Matches hybrid_600M.yaml exactly
+        # ---- Load YAML config — builds all model objects automatically ----
+        print(f"  Loading config: {yaml_config}")
+        with open(yaml_config, encoding="utf-8") as f:
+            hparams = load_hyperpyyaml(f)
 
-        # Preprocessing: Fbank features
-        self.compute_features = Fbank(
-            sample_rate=16000, n_fft=400, n_mels=80,
-            hop_length=10, win_length=25,
-        )
+        # Extract the objects hyperpyyaml instantiated
+        self.compute_features = hparams["compute_features"]
+        self.normalize = hparams["normalize"]
 
-        # Input normalization (sentence-level)
-        self.normalize = InputNormalization(norm_type="sentence")
-
-        # CNN frontend
-        self.cnn = ConvolutionFrontEnd(
-            input_shape=(8, 10, 80),
-            num_blocks=2, num_layers_per_block=1,
-            out_channels=(128, 64),
-            kernel_sizes=(3, 3), strides=(2, 2),
-            residuals=(False, False),
-        )
-
-        # Conformer encoder (24 layers, d_model=1024)
-        self.transformer = TransformerASR(
-            input_size=1280,  # CNN output: 20 * 64 = 1280
-            tgt_vocab=5000, d_model=1024, nhead=8,
-            num_encoder_layers=24, num_decoder_layers=0,
-            d_ffn=4096, dropout=0.0,  # dropout=0 for frozen inference
-            activation=torch.nn.GELU,
-            conformer_activation=torch.nn.GELU,
-            encoder_module="conformer",
-            attention_type="RelPosMHAXL",
-            normalize_before=True, causal=False,
-        )
-        self.wrapper = EncoderWrapper(transformer=self.transformer)
+        # model is nn.ModuleList([CNN, wrapper])
+        model_list = hparams["model"]
+        self.cnn = model_list[0]
+        self.wrapper = model_list[1]
+        self.transformer = hparams["Transformer"]
 
         # ---- Load pretrained weights ----
         model_ckpt_path = os.path.join(model_dir, "model.ckpt")
         norm_ckpt_path = os.path.join(model_dir, "normalizer.ckpt")
 
         if not os.path.exists(model_ckpt_path):
-            # Try nested path from snapshot_download
-            alt_path = os.path.join(model_dir, "model", "save", "CKPT+latest")
-            if os.path.isdir(alt_path):
-                model_ckpt_path = os.path.join(alt_path, "model.ckpt")
-                norm_ckpt_path = os.path.join(alt_path, "normalizer.ckpt")
-            else:
-                # Search for it
-                for root, dirs, files in os.walk(model_dir):
-                    if "model.ckpt" in files:
-                        model_ckpt_path = os.path.join(root, "model.ckpt")
-                        norm_ckpt_path = os.path.join(root, "normalizer.ckpt")
-                        break
+            # Search for it (snapshot_download may nest files)
+            for root, dirs, files in os.walk(model_dir):
+                if "model.ckpt" in files:
+                    model_ckpt_path = os.path.join(root, "model.ckpt")
+                    norm_ckpt_path = os.path.join(root, "normalizer.ckpt")
+                    break
 
         print(f"  Loading model checkpoint: {model_ckpt_path}")
         assert os.path.exists(model_ckpt_path), f"model.ckpt not found. Searched: {model_dir}"
 
-        # The checkpoint is nn.ModuleList([CNN, wrapper]) state dict
-        # Keys: 0.* = CNN, 1.* = wrapper
-        model_list = nn.ModuleList([self.cnn, self.wrapper])
         state_dict = torch.load(model_ckpt_path, map_location="cpu", weights_only=True)
         model_list.load_state_dict(state_dict)
         print(f"  Model checkpoint loaded: {len(state_dict)} keys")
@@ -257,13 +225,11 @@ class ArabEstCTCProbe(nn.Module):
             print(f"  Loading normalizer: {norm_ckpt_path}")
             norm_state = torch.load(norm_ckpt_path, map_location="cpu", weights_only=True)
             self.normalize.load_state_dict(norm_state)
-            # Force eval mode on normalizer so it uses saved stats, doesn't update
             self.normalize.eval()
         else:
             print("  WARNING: normalizer.ckpt not found — using unnormalized features")
 
         # ---- Enable hidden state extraction ----
-        # SpeechBrain's ConformerEncoder has output_hidden_states built in
         self.transformer.encoder.output_hidden_states = True
         self.transformer.output_hidden_states = True
 
@@ -279,14 +245,11 @@ class ArabEstCTCProbe(nn.Module):
         self.cnn.eval()
         self.wrapper.eval()
 
-        # ---- Probe head ----
-        num_layers = 24
-        hidden_size = 1024
+        # ---- Probe head — dimensions read from the config, not hardcoded ----
+        num_layers = hparams["num_encoder_layers"]
+        hidden_size = hparams["d_model"]
 
-        # Learnable layer weights (initialized to zero → uniform via softmax)
         self.layer_weights = nn.Parameter(torch.zeros(num_layers))
-
-        # CTC linear projection
         self.lm_head = nn.Linear(hidden_size, vocab_size)
         self.ctc_loss = nn.CTCLoss(blank=pad_token_id, reduction="mean", zero_infinity=True)
 
@@ -579,9 +542,11 @@ def evaluate_casablanca(model, dataset, vocab, batch_size=8, device="cuda"):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="AraBEST-RQ 600M Probe (Weighted Layer Sum + CTC)")
+    parser = argparse.ArgumentParser(description="AraBEST-RQ Probe (Weighted Layer Sum + CTC)")
     parser.add_argument("--model_dir", default="/workspace/arabest_model",
-                        help="Path to downloaded AraBEST-RQ-600M-14k model")
+                        help="Path to downloaded AraBEST-RQ checkpoint dir")
+    parser.add_argument("--yaml_config", required=True,
+                        help="Path to AraBEST-RQ YAML config (e.g. hybrid_300M.yaml)")
     parser.add_argument("--train_data", default="/workspace/datasets/train_combined")
     parser.add_argument("--eval_casablanca", default="/workspace/datasets/eval_casablanca_test")
     parser.add_argument("--eval_mgb2", default="/workspace/datasets/eval_mgb2_test")
@@ -630,9 +595,10 @@ def main():
     )
 
     # ---- 2. MODEL ----
-    print("Loading AraBEST-RQ 600M encoder...")
+    print("Loading AraBEST-RQ encoder...")
     model = ArabEstCTCProbe(
-        model_dir=args.model_dir, vocab_size=len(vocab), device=device,
+        model_dir=args.model_dir, yaml_config=args.yaml_config,
+        vocab_size=len(vocab), device=device,
     ).to(device)
 
     if args.checkpoint:
