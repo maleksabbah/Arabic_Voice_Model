@@ -215,8 +215,8 @@ class ArabEstCTCFinetune(nn.Module):
 
         if os.path.exists(norm_ckpt_path):
             print(f"  Loading normalizer: {norm_ckpt_path}")
-            norm_state = torch.load(norm_ckpt_path, map_location="cpu", weights_only=True)
-            self.normalize.load_state_dict(norm_state)
+            # A SpeechBrain stats dict (count/glob_mean/glob_std), not a state_dict
+            self.normalize._load(norm_ckpt_path)
             self.normalize.eval()
         else:
             print("  WARNING: normalizer.ckpt not found")
