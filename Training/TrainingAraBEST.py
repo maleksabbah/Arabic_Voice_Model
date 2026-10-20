@@ -11,11 +11,23 @@ Key differences from the frozen probe:
   - model.train() keeps L1-16 frozen in eval, L17-19 in train mode
 
 Usage:
-  python TrainingAraBEST.py \
+  python finetune_arabest.py \
     --model_dir /workspace/arabest_model \
     --yaml_config /workspace/AraBEST-RQ/model/hparams/hybrid_300M.yaml \
     --train_data /workspace/datasets/train_combined \
     --output_dir /workspace/finetune_output_arabest \
+    --unfreeze_layers 17,18,19 \
+    --encoder_lr 1e-5 \
+    --head_lr 1e-3
+
+  With MGB-3 Egyptian data added to training:
+  python finetune_arabest.py \
+    --model_dir /workspace/arabest_model \
+    --yaml_config /workspace/AraBEST-RQ/model/hparams/hybrid_300M.yaml \
+    --train_data /workspace/datasets/train_combined \
+    --output_dir /workspace/finetune_output_arabest_mgb3 \
+    --mgb3 \
+    --checkpoint /workspace/finetune_output_arabest/best \
     --unfreeze_layers 17,18,19 \
     --encoder_lr 1e-5 \
     --head_lr 1e-3
@@ -26,7 +38,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from datasets import load_from_disk, Audio
+from datasets import load_from_disk, load_dataset, concatenate_datasets, Audio
 from tqdm import tqdm
 import evaluate
 from hyperpyyaml import load_hyperpyyaml
@@ -36,7 +48,7 @@ from hyperpyyaml import load_hyperpyyaml
 # UTILS
 # ============================================================
 
-ARABIC_DIACRITICS = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]')
+ARABIC_DIACRITICS = re.compile(r'[ؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۤۧۨ-ۭ]')
 
 
 def normalize_arabic(text):
@@ -648,7 +660,15 @@ def main():
                         help="Comma-separated 1-indexed layer numbers to unfreeze (default: 17,18,19)")
     parser.add_argument("--no_grad_checkpoint", action="store_true",
                         help="Disable gradient checkpointing (uses more VRAM but faster)")
+    parser.add_argument("--mgb3", action="store_true",
+                        help="Add MGB-3 Egyptian Arabic to training data (downloaded from HuggingFace)")
+    parser.add_argument("--mgb3_train_frac", type=float, default=0.9,
+                        help="Fraction of MGB-3 to use for training (rest held out for eval)")
+    parser.add_argument("--eval_mgb3", action="store_true",
+                        help="Evaluate on MGB-3 test split (auto-enabled when --mgb3 is set)")
     args = parser.parse_args()
+    if args.mgb3:
+        args.eval_mgb3 = True
 
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -658,7 +678,46 @@ def main():
     print("Loading data...")
     train_dataset = load_from_disk(args.train_data)
     train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=16000))
-    print(f"  Raw: {len(train_dataset)} samples")
+    print(f"  Raw (base): {len(train_dataset)} samples")
+
+    # Optionally add MGB-3 Egyptian Arabic
+    mgb3_eval_split = None
+    if args.mgb3:
+        print("Loading MGB-3 (Egyptian Arabic) from HuggingFace...")
+        mgb3_full = load_dataset("MightyStudent/Egyptian-ASR-MGB-3", split="train", trust_remote_code=True)
+        mgb3_full = mgb3_full.cast_column("audio", Audio(sampling_rate=16000))
+        print(f"  MGB-3 total: {len(mgb3_full)} samples")
+
+        # Rename 'sentence' -> 'normalized_text' with Arabic normalization
+        def prep_mgb3(sample):
+            sample["normalized_text"] = normalize_arabic(sample.get("sentence", ""))
+            return sample
+        mgb3_full = mgb3_full.map(prep_mgb3, remove_columns=["sentence"])
+
+        # Split into train/eval
+        n_total = len(mgb3_full)
+        n_train = int(n_total * args.mgb3_train_frac)
+        indices = list(range(n_total))
+        np.random.seed(42)
+        np.random.shuffle(indices)
+        mgb3_train = mgb3_full.select(indices[:n_train])
+        mgb3_eval_split = mgb3_full.select(indices[n_train:])
+        print(f"  MGB-3 train: {len(mgb3_train)}, eval: {len(mgb3_eval_split)}")
+
+        # Align columns and concatenate
+        # Keep only columns that exist in both datasets
+        common_cols = set(train_dataset.column_names) & set(mgb3_train.column_names)
+        # Ensure audio and normalized_text are there
+        common_cols = common_cols | {"audio", "normalized_text"}
+        drop_base = [c for c in train_dataset.column_names if c not in common_cols]
+        drop_mgb3 = [c for c in mgb3_train.column_names if c not in common_cols]
+        if drop_base:
+            train_dataset = train_dataset.remove_columns(drop_base)
+        if drop_mgb3:
+            mgb3_train = mgb3_train.remove_columns(drop_mgb3)
+
+        train_dataset = concatenate_datasets([train_dataset, mgb3_train])
+        print(f"  Combined: {len(train_dataset)} samples")
 
     print("Filtering...")
     train_dataset = filter_dataset(train_dataset)
@@ -748,6 +807,24 @@ def main():
         ds = load_from_disk(args.eval_fleurs).cast_column("audio", Audio(sampling_rate=16000))
         ds = filter_dataset(ds)
         results["fleurs"] = evaluate_dataset(model, ds, vocab, args.batch_size, "FLEURS", device)
+
+    if args.eval_mgb3:
+        if mgb3_eval_split is not None:
+            # Use the held-out split from training
+            print(f"\nEvaluating on MGB-3 held-out split ({len(mgb3_eval_split)} samples)...")
+            mgb3_eval_split = filter_dataset(mgb3_eval_split)
+            results["mgb3"] = evaluate_dataset(model, mgb3_eval_split, vocab, args.batch_size, "MGB-3 (Egyptian)", device)
+        else:
+            # Load full MGB-3 for eval-only mode
+            print("\nLoading MGB-3 for evaluation...")
+            mgb3_eval = load_dataset("MightyStudent/Egyptian-ASR-MGB-3", split="train", trust_remote_code=True)
+            mgb3_eval = mgb3_eval.cast_column("audio", Audio(sampling_rate=16000))
+            def prep_mgb3_eval(sample):
+                sample["normalized_text"] = normalize_arabic(sample.get("sentence", ""))
+                return sample
+            mgb3_eval = mgb3_eval.map(prep_mgb3_eval, remove_columns=["sentence"])
+            mgb3_eval = filter_dataset(mgb3_eval)
+            results["mgb3"] = evaluate_dataset(model, mgb3_eval, vocab, args.batch_size, "MGB-3 (Egyptian)", device)
 
     # Save layer weights
     w = model.get_layer_weight_distribution()
