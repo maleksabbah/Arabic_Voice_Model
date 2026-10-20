@@ -151,12 +151,13 @@ class ArabEstProbeDataset(Dataset):
             array = array[: self.max_audio_len]
         text = item.get("normalized_text", "")
         labels = text_to_labels(text, self.vocab)
-        return {"audio": array, "labels": labels}
+        return {"audio": array, "labels": labels, "reference": text}
 
 
 def collate_fn(batch):
     audios = [torch.from_numpy(item["audio"]) for item in batch]
     labels_list = [item["labels"] for item in batch]
+    refs = [item["reference"] for item in batch]
 
     max_audio = max(a.shape[0] for a in audios)
     padded_audio = torch.zeros(len(audios), max_audio)
@@ -174,6 +175,7 @@ def collate_fn(batch):
         "audio": padded_audio,
         "audio_lengths": audio_lengths,
         "labels": padded_labels,
+        "references": refs,
     }
 
 
@@ -589,10 +591,8 @@ def evaluate_dataset(model, dataset, vocab, batch_size=8, name="eval", device="c
             outputs = model(audio=audio, audio_lengths=audio_lengths)
             pred_ids = torch.argmax(outputs["logits"], dim=-1).cpu()
 
-            for pred, label in zip(pred_ids.tolist(), batch["labels"].tolist()):
+            for pred, ref_text in zip(pred_ids.tolist(), batch["references"]):
                 pred_text = ctc_decode(pred, id_to_char)
-                ref_ids = [x for x in label if x != -100]
-                ref_text = ctc_decode(ref_ids, id_to_char)
                 if ref_text.strip():
                     all_preds.append(pred_text)
                     all_refs.append(ref_text)
