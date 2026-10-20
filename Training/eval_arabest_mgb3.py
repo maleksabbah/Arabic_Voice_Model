@@ -149,7 +149,9 @@ def main():
     print(f"  Using {n_samples} samples")
 
     # Filter empty refs
-    mgb3 = mgb3.filter(lambda x: bool(normalize_arabic(x["sentence"]).strip()))
+    # No cache: its fingerprint can't see changes inside normalize_arabic
+    mgb3 = mgb3.filter(lambda x: bool(normalize_arabic(x["sentence"]).strip()),
+                       load_from_cache_file=False)
     print(f"  After filtering empty: {len(mgb3)} samples")
 
     # Build dataloader
