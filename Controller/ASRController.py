@@ -1077,3 +1077,80 @@ def upload_page():
         </body>
         </html>
         """
+
+
+# =============================================================================
+# YOUTUBE CHANNEL ENUMERATION
+# =============================================================================
+
+@router.post("/enumerate/csv")
+def enumerate_from_csv(
+    csv_path: str = Form(...),
+    max_per_channel: int = Form(500),
+    db: Session = Depends(get_db),
+):
+    """
+    Enumerate all channels from channels.csv and populate the video queue.
+    This is a long-running call — 242 channels takes a while.
+    """
+    svc = IngestionService(db)
+    try:
+        result = svc.enumerate_from_csv(csv_path, max_per_channel)
+        return result
+    except IngestionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"CSV not found: {csv_path}")
+
+
+@router.post("/enumerate/channel")
+def enumerate_channel(
+    handle: str = Form(...),
+    dialect: str = Form(...),
+    sub_dialect: str = Form(""),
+    genre: str = Form(""),
+    max_videos: int = Form(500),
+    db: Session = Depends(get_db),
+):
+    """Enumerate a single YouTube channel and add its videos to the queue."""
+    svc = IngestionService(db)
+    result = svc.enumerate_channel(
+        handle=handle,
+        dialect=dialect,
+        sub_dialect=sub_dialect,
+        genre=genre,
+        max_videos=max_videos,
+    )
+    return result
+
+
+@router.get("/enumerate/stats")
+def get_queue_stats(db: Session = Depends(get_db)):
+    """Get hours per dialect in the video queue with estimated clean hours."""
+    svc = IngestionService(db)
+    return svc.get_queue_stats()
+
+
+@router.get("/enumerate/concentration/{dialect}")
+def get_channel_concentration(
+    dialect: str,
+    top_n: int = 20,
+    db: Session = Depends(get_db),
+):
+    """
+    Top channels by hours for a dialect with percentage share.
+    No single channel should dominate >5%.
+    """
+    svc = IngestionService(db)
+    return svc.get_channel_concentration(dialect, top_n)
+
+
+@router.get("/enumerate/pending")
+def get_pending_videos(
+    dialect: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """Get pending videos from the queue, ready for download."""
+    svc = IngestionService(db)
+    return svc.get_pending_videos(dialect=dialect, limit=limit)
